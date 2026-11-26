@@ -123,10 +123,15 @@ pub trait KeyhiveStore<F: FutureForm, T: ContentRef> {
         who: IndividualId,
     ) -> F::Future<'_, Result<Vec<Digest<KeyOp>>, Self::Error>>;
 
-    /// How many prekey operations each individual has here, without loading
-    /// them: what a caller that serves a peer compares to see whether anything
-    /// changed. Individuals without any are left out.
-    fn count_prekey_ops(&self) -> F::Future<'_, Result<BTreeMap<IndividualId, u64>, Self::Error>>;
+    /// How many prekey and CGKA operations this store holds, all documents and
+    /// individuals together, for a caller that compares two counts to see
+    /// whether anything was added in between.
+    ///
+    /// A store-wide counter that every `append_prekey_ops` and `append_cgka_ops`
+    /// bumps in the same write, once per operation it did not hold, so it is
+    /// monotone and reading it scans nothing. It is not a count of rows to
+    /// derive on each call: a backend that does would scan an index per sync.
+    fn total_op_count(&self) -> F::Future<'_, Result<u64, Self::Error>>;
 
     /// Every individual with prekey operations here.
     fn list_individuals(&self) -> F::Future<'_, Result<Vec<IndividualId>, Self::Error>>;
@@ -156,10 +161,6 @@ pub trait KeyhiveStore<F: FutureForm, T: ContentRef> {
         &self,
         doc: DocumentId,
     ) -> F::Future<'_, Result<Vec<CgkaOpIndexRow>, Self::Error>>;
-
-    /// How many CGKA operations each document has here, without loading them:
-    /// a backend counts rows. Documents without any are left out.
-    fn count_cgka_ops(&self) -> F::Future<'_, Result<BTreeMap<DocumentId, u64>, Self::Error>>;
 
     /// Keep CGKA operations of `doc`. Keeping one again changes nothing.
     fn append_cgka_ops<'a>(

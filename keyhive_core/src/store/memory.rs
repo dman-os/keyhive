@@ -37,6 +37,8 @@ struct Inner<T: ContentRef> {
     content_keys: HashMap<(DocumentId, T), SymmetricKey>,
     pending_events: HashMap<Digest<StaticEvent<T>>, StaticEvent<T>>,
     cgka_reads: Vec<DocumentId>,
+    /// Prekey and CGKA operations ever appended, each counted once.
+    total_ops: u64,
 }
 
 impl<T: ContentRef> Clone for MemoryKeyhiveStore<T> {
@@ -55,6 +57,7 @@ impl<T: ContentRef> Default for MemoryKeyhiveStore<T> {
             content_keys: HashMap::new(),
             pending_events: HashMap::new(),
             cgka_reads: Vec::new(),
+            total_ops: 0,
         })))
     }
 }
@@ -109,9 +112,12 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
     ) -> F::Future<'a, Result<(), Self::Error>> {
         let mut inner = self.lock();
         let held = inner.prekey_ops.entry(who).or_default();
+        let before = held.len();
         for op in ops {
             held.insert(op.digest(), op.clone());
         }
+        let added = (held.len() - before) as u64;
+        inner.total_ops += added;
         F::ready(Ok(()))
     }
 
@@ -143,15 +149,8 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
         F::ready(Ok(digests))
     }
 
-    fn count_prekey_ops(&self) -> F::Future<'_, Result<BTreeMap<IndividualId, u64>, Self::Error>> {
-        let counts = self
-            .lock()
-            .prekey_ops
-            .iter()
-            .filter(|(_, held)| !held.is_empty())
-            .map(|(who, held)| (*who, held.len() as u64))
-            .collect();
-        F::ready(Ok(counts))
+    fn total_op_count(&self) -> F::Future<'_, Result<u64, Self::Error>> {
+        F::ready(Ok(self.lock().total_ops))
     }
 
     fn list_individuals(&self) -> F::Future<'_, Result<Vec<IndividualId>, Self::Error>> {
@@ -207,17 +206,6 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
         F::ready(Ok(rows))
     }
 
-    fn count_cgka_ops(&self) -> F::Future<'_, Result<BTreeMap<DocumentId, u64>, Self::Error>> {
-        let counts = self
-            .lock()
-            .cgka_ops
-            .iter()
-            .filter(|(_, held)| !held.is_empty())
-            .map(|(doc, held)| (*doc, held.len() as u64))
-            .collect();
-        F::ready(Ok(counts))
-    }
-
     fn append_cgka_ops<'a>(
         &'a self,
         doc: DocumentId,
@@ -225,9 +213,12 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
     ) -> F::Future<'a, Result<(), Self::Error>> {
         let mut inner = self.lock();
         let held = inner.cgka_ops.entry(doc).or_default();
+        let before = held.len();
         for op in ops {
             held.insert(op.digest(), op.clone());
         }
+        let added = (held.len() - before) as u64;
+        inner.total_ops += added;
         F::ready(Ok(()))
     }
 

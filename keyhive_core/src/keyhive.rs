@@ -2705,71 +2705,31 @@ where
             .collect()
     }
 
-    /// How many operations this replica holds: certificates, prekey operations
-    /// and CGKA operations. It only ever grows, so a caller that compares two
-    /// counts learns whether anything was added in between, which is all it is
-    /// for.
+    /// How many operations this replica holds: certificates, and the prekey and
+    /// CGKA operations its store holds. It only ever grows, so a caller that
+    /// compares two counts learns whether anything was added in between, which
+    /// is all it is for. It reads one counter from the store
+    /// ([`KeyhiveStore::total_op_count`]) and loads no document.
     ///
-    /// A document or an individual that is loaded counts what is loaded, and
-    /// one that is not counts the rows its store holds, so the count is the
-    /// same before and after a document is [hydrated](Self::hydrate) and reads
-    /// no document. That holds while a loaded entity holds everything the store
-    /// does, as it does when it was hydrated before an operation for it was
-    /// ingested; an operation ingested for an individual that is not loaded
-    /// leaves one that holds only that operation.
+    /// The store is the source of the count because a keyhive is persisted
+    /// first: a caller keeps what it ingests or issues in the store (see the
+    /// [`store`](crate::store) module) before or as the keyhive applies it, so
+    /// what is loaded is a subset of what the store holds. An operation that
+    /// was applied in memory and not yet kept does not count until it is.
     pub async fn total_ops(&self) -> Result<u64, HydrateError> {
-        let mut total = 0;
-        let mut loaded_individuals = BTreeSet::new();
-        for (id, individual) in self.individuals.lock().await.iter() {
-            total += individual.lock().await.prekey_ops().len() as u64;
-            loaded_individuals.insert(*id);
-        }
-        let mut loaded_documents = BTreeSet::new();
-        let held: Vec<_> = {
-            self.documents
-                .lock()
-                .await
-                .iter()
-                .map(|(id, doc)| (*id, doc.dupe()))
-                .collect()
-        };
-        for (id, doc) in held {
-            total += doc.lock().await.cgka().ops_count() as u64;
-            loaded_documents.insert(id);
-        }
-        for (id, cgka) in self.unjoined.lock().await.iter() {
-            total += cgka.ops_count() as u64;
-            loaded_documents.insert(*id);
-        }
-        total += self
+        let stored = self
+            .store
+            .total_op_count()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        let certificates = self
             .keyline()
             .certificates()
             .await
             .map_err(KeylineStorageError::new)?
             .value
             .len() as u64;
-
-        let stored_ops = self
-            .store
-            .count_cgka_ops()
-            .await
-            .map_err(|e| HydrateError::Store(Box::new(e)))?;
-        total += stored_ops
-            .into_iter()
-            .filter(|(doc, _)| !loaded_documents.contains(doc))
-            .map(|(_, count)| count)
-            .sum::<u64>();
-        let stored_prekeys = self
-            .store
-            .count_prekey_ops()
-            .await
-            .map_err(|e| HydrateError::Store(Box::new(e)))?;
-        total += stored_prekeys
-            .into_iter()
-            .filter(|(who, _)| !loaded_individuals.contains(who))
-            .map(|(_, count)| count)
-            .sum::<u64>();
-        Ok(total)
+        Ok(stored + certificates)
     }
 
     #[allow(clippy::type_complexity)]
