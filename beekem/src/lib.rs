@@ -48,4 +48,5 @@ mod tests {
     mod invitations;
     mod path_secrets;
     mod predecessor_secret_chain;
+    mod prepared_write;
 }
