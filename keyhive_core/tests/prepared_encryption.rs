@@ -189,6 +189,7 @@ async fn the_listener_hears_of_the_rotation_at_apply_only() -> Result<()> {
         Log<[u8; 32]>,
         ThreadRng,
         MemoryKeyline<ContentHeads<[u8; 32]>>,
+        keyhive_core::store::memory::MemoryKeyhiveStore<[u8; 32]>,
     >;
     async fn hive() -> (Hive, Log<[u8; 32]>) {
         let log = Log::<[u8; 32]>::new();
@@ -197,6 +198,7 @@ async fn the_listener_hears_of_the_rotation_at_apply_only() -> Result<()> {
             MemoryCiphertextStore::new(),
             log.clone(),
             MemoryKeyline::new(),
+            keyhive_core::store::memory::MemoryKeyhiveStore::default(),
             rand::thread_rng(),
         )
         .await

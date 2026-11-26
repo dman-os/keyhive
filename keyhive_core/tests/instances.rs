@@ -355,6 +355,7 @@ async fn a_keyhive_built_outside_the_context_can_join_the_cast() -> Result<()> {
         MemoryCiphertextStore::new(),
         NoListener,
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         csprng,
     )
     .await?;

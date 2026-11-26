@@ -21,6 +21,7 @@ pub async fn make_simple_keyhive() -> Result<Hive, SignError> {
         MemoryCiphertextStore::new(),
         NoListener,
         KeylineStore::new(),
+        crate::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await

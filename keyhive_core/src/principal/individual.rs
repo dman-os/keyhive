@@ -11,6 +11,7 @@ use crate::{
     content::heads::ContentHeads,
     keyhive::Keyhive,
     listener::membership::MembershipListener,
+    store::KeyhiveStore,
     transact::{fork::Fork, merge::Merge},
     util::content_addressed_map::CaMap,
 };
@@ -332,7 +333,7 @@ impl<KH> Individual<KH> {
     }
 }
 
-impl<F, S, T, P, C, L, R, K> Individual<Keyhive<F, S, T, P, C, L, R, K>>
+impl<F, S, T, P, C, L, R, K, H> Individual<Keyhive<F, S, T, P, C, L, R, K, H>>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -342,6 +343,7 @@ where
     L: MembershipListener<F, T>,
     R: CryptoRng + RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     /// Pick a prekey for this individual for `doc`, or `None` if it has no

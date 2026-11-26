@@ -15,8 +15,10 @@ use crate::{
         document::{archive::DocumentArchive, id::DocumentId},
         individual::{id::IndividualId, IndividualState},
     },
+    store::KeyhiveStore,
 };
 use beekem::operation::CgkaOperation;
+use future_form::FutureForm;
 use keyhive_codec::{
     error::DecodeError,
     prefixed::{decode_len, decode_list, encode_len, encode_list},
@@ -28,7 +30,10 @@ use keyhive_crypto::{
     verified,
 };
 use keyline::certificate::Certificate;
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use zeroize::Zeroizing;
 
 /// What a [`Keyhive`][crate::keyhive::Keyhive] stores to be rebuilt.
@@ -52,11 +57,73 @@ impl<T: ContentRef> Archive<T> {
 
     /// The format this build reads and writes. Only it decodes, so an archive
     /// in another format is refused rather than misread.
-    pub const FORMAT: u8 = 4;
+    pub const FORMAT: u8 = 5;
 
     /// Getter for the user that the [`Archive`] is for.
     pub fn id(&self) -> IndividualId {
         self.active.individual.id()
+    }
+
+    /// Keep everything this archive holds in `store`, so that
+    /// [`Keyhive::open`][crate::keyhive::Keyhive::open] over it gives the replica the
+    /// archive describes: the migration from an archive to a store. Its
+    /// certificates are not written: they belong to the Keyline store.
+    ///
+    /// Writing is idempotent, so a failed migration is run again.
+    pub async fn write_to_store<F: FutureForm, H: KeyhiveStore<F, T>>(
+        &self,
+        store: &H,
+    ) -> Result<(), WriteToStoreError<H::Error>> {
+        let pairs: Vec<_> = self
+            .active
+            .key_pairs
+            .iter()
+            .map(|(pk, sk)| (*pk, sk.clone()))
+            .collect();
+        store
+            .put_key_pairs(&pairs)
+            .await
+            .map_err(WriteToStoreError::Store)?;
+        for state in self.individuals.values().chain([&self.active.individual]) {
+            let ops: Vec<_> = state.prekey_ops().values().cloned().collect();
+            store
+                .append_prekey_ops(state.id(), &ops)
+                .await
+                .map_err(WriteToStoreError::Store)?;
+        }
+        let mut by_doc: HashMap<DocumentId, Vec<Arc<verified::Verified<CgkaOperation>>>> =
+            HashMap::new();
+        for signed in &self.cgka_ops {
+            let op = signed.clone().verify()?;
+            by_doc
+                .entry(DocumentId::from(op.payload().doc_id))
+                .or_default()
+                .push(Arc::new(op));
+        }
+        for (doc, ops) in by_doc {
+            store
+                .append_cgka_ops(doc, &ops)
+                .await
+                .map_err(WriteToStoreError::Store)?;
+        }
+        for (doc, archived) in &self.docs {
+            let heads: Vec<_> = archived.content_heads.iter().cloned().collect();
+            store
+                .put_content_heads(*doc, &heads)
+                .await
+                .map_err(WriteToStoreError::Store)?;
+            for (content_ref, key) in &archived.content_keys {
+                store
+                    .cache_content_key(*doc, content_ref, key)
+                    .await
+                    .map_err(WriteToStoreError::Store)?;
+            }
+        }
+        store
+            .put_pending_events(&self.pending_events)
+            .await
+            .map_err(WriteToStoreError::Store)?;
+        Ok(())
     }
 
     /// The archive's encoding, the same bytes as [`Encode`] gives, in a buffer
@@ -135,6 +202,18 @@ impl<T: ContentRef> Archive<T> {
         encode_by_key(&self.certificates, |cert| cert.id(), out);
         encode_by_key(&self.pending_events, |event| event.digest(), out);
     }
+}
+
+/// Why an archive could not be written to a store.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteToStoreError<E: core::error::Error + 'static> {
+    /// An archived CGKA operation does not verify.
+    #[error(transparent)]
+    Verify(#[from] verified::VerifyError),
+
+    /// The store failed.
+    #[error("the store failed: {0}")]
+    Store(E),
 }
 
 /// `"KHIV" ‖ format ‖ active ‖ individuals ‖ docs ‖ cgka_ops ‖ certificates ‖

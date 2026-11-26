@@ -51,6 +51,7 @@ impl JsArchive {
             ciphertext_store.clone(),
             event_handler.clone().into(),
             MemoryKeyline::new(),
+            keyhive_core::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(OsRng)),
         )
         .await

@@ -34,11 +34,12 @@ fn toggle_delegate_revoke(bencher: Bencher, prior_toggles: usize) {
         let sk = MemorySigner::generate(&mut csprng);
         let store = Arc::new(Mutex::new(MemoryCiphertextStore::<[u8; 32], Vec<u8>>::new()));
 
-        let kh = Keyhive::<Local, _, _, _, _, _, _, _>::generate(
+        let kh = Keyhive::<Local, _, _, _, _, _, _, _, _>::generate(
             sk.clone(),
             store.clone(),
             NoListener,
             MemoryKeyline::new(),
+            keyhive_core::store::memory::MemoryKeyhiveStore::default(),
             OsRng,
         )
         .await

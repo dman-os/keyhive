@@ -1162,6 +1162,7 @@ async fn a_reader_whose_remove_failed_to_sign_is_removed_at_the_next_write() -> 
         MemoryCiphertextStore::<[u8; 32], Vec<u8>>::new(),
         NoListener,
         KeylineStore::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await?;
@@ -1365,6 +1366,7 @@ async fn restored_from_before_a_grant() -> TestResult<(Hive, Hive, Hive, Documen
         MemoryCiphertextStore::new(),
         NoListener,
         KeylineStore::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await?;
@@ -1391,6 +1393,7 @@ async fn restored_from_before_a_grant() -> TestResult<(Hive, Hive, Hive, Documen
         MemoryCiphertextStore::new(),
         NoListener,
         store,
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         Arc::new(futures::lock::Mutex::new(OsRng)),
     )
     .await?;

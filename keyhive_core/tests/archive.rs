@@ -206,12 +206,13 @@ async fn an_archive_does_not_load_with_another_identitys_signer() -> Result<()> 
     let alice = ctx.individual("alice").await?;
     let archive = alice.into_archive().await?;
 
-    let result = Keyhive::<Sendable, _, [u8; 32], Vec<u8>, _, _, _, _>::try_from_archive(
+    let result = Keyhive::<Sendable, _, [u8; 32], Vec<u8>, _, _, _, _, _>::try_from_archive(
         &archive,
         MemorySigner::generate(&mut rand::rngs::OsRng),
         MemoryCiphertextStore::new(),
         NoListener,
         KeylineStore::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         Arc::new(futures::lock::Mutex::new(rand::rngs::OsRng)),
     )
     .await;
@@ -417,15 +418,15 @@ async fn only_an_archive_in_the_current_format_decodes() -> Result<()> {
     let mut ctx = TestContext::new().await;
     let alice = ctx.individual("alice").await?;
     let bytes = alice.into_archive().await?.encode().into_bytes();
-    assert_eq!(bytes[..5], *b"KHIV\x04");
+    assert_eq!(bytes[..5], *b"KHIV\x05");
 
     let mut older = bytes.clone();
-    older[4] = 3;
+    older[4] = 4;
     assert_eq!(
         Archive::<[u8; 32]>::decode(&older),
         Err(DecodeError::UnsupportedVersion {
             kind: b'I',
-            version: 3
+            version: 4
         })
     );
 

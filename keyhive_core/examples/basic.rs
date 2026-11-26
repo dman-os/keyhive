@@ -304,6 +304,7 @@ type Peer = Keyhive<
     NoListener,
     OsRng,
     MemoryKeyline<ContentHeads<[u8; 32]>>,
+    keyhive_core::store::memory::MemoryKeyhiveStore<[u8; 32]>,
 >;
 
 type Error = Box<dyn std::error::Error>;
@@ -315,6 +316,7 @@ async fn new_peer() -> Result<Peer, Error> {
         MemoryCiphertextStore::new(),
         NoListener,
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await?)

@@ -23,6 +23,7 @@ async fn make_keyhive() -> Keyhive<
     Log<[u8; 32]>,
     ThreadRng,
     MemoryKeyline<ContentHeads<[u8; 32]>>,
+    keyhive_core::store::memory::MemoryKeyhiveStore<[u8; 32]>,
 > {
     make_keyhive_with_signer(MemorySigner::generate(&mut rand::thread_rng())).await
 }
@@ -39,14 +40,16 @@ async fn make_keyhive_with_signer(
     Log<[u8; 32]>,
     ThreadRng,
     MemoryKeyline<ContentHeads<[u8; 32]>>,
+    keyhive_core::store::memory::MemoryKeyhiveStore<[u8; 32]>,
 > {
     let store: MemoryCiphertextStore<[u8; 32], Vec<u8>> = MemoryCiphertextStore::new();
     let log = Log::<[u8; 32]>::new();
-    Keyhive::<Local, _, _, _, _, _, _, _>::generate(
+    Keyhive::<Local, _, _, _, _, _, _, _, _>::generate(
         sk,
         store,
         log,
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         rand::thread_rng(),
     )
     .await
@@ -65,11 +68,12 @@ async fn test_dual_instance_log_based_sync() -> TestResult {
     // The second instance keeps a Log listener, which is how a sync protocol collects
     // what an instance produced.
     let worker_log = Log::<[u8; 32]>::new();
-    let alice_worker = Keyhive::<Local, _, _, _, _, _, _, _>::generate(
+    let alice_worker = Keyhive::<Local, _, _, _, _, _, _, _, _>::generate(
         alice_signer.clone(),
         MemoryCiphertextStore::<[u8; 32], Vec<u8>>::new(),
         worker_log.clone(),
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         rand::thread_rng(),
     )
     .await

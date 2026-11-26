@@ -352,8 +352,14 @@ async fn concurrent_updates_conflict_the_root_until_one_covers_them() -> Result<
 
     alice.force_pcs_update(design_doc).await?;
     ctx.sync(&alice, &bob).await?;
-    let on_alice = alice.try_pcs_key_hash(design_doc).await.map_err(|e| e.to_string())?;
-    let on_bob = bob.try_pcs_key_hash(design_doc).await.map_err(|e| e.to_string())?;
+    let on_alice = alice
+        .try_pcs_key_hash(design_doc)
+        .await
+        .map_err(|e| e.to_string())?;
+    let on_bob = bob
+        .try_pcs_key_hash(design_doc)
+        .await
+        .map_err(|e| e.to_string())?;
     assert_eq!(on_alice, on_bob, "the covered root derives one key");
     Ok(())
 }

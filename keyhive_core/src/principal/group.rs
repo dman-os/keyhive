@@ -11,6 +11,7 @@ use crate::{
     keyhive::Keyhive,
     listener::membership::MembershipListener,
     principal::document::AddMemberError,
+    store::KeyhiveStore,
     update::{AddMemberUpdate, RevokeMemberUpdate},
 };
 use beekem::error::CgkaError;
@@ -53,7 +54,7 @@ impl<KH> Group<KH> {
     }
 }
 
-impl<F, S, T, P, C, L, R, K> Group<Keyhive<F, S, T, P, C, L, R, K>>
+impl<F, S, T, P, C, L, R, K, H> Group<Keyhive<F, S, T, P, C, L, R, K, H>>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -63,6 +64,7 @@ where
     L: MembershipListener<F, T>,
     R: CryptoRng + RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     /// The live delegations about this group: its direct members.

@@ -15,7 +15,7 @@ use crate::{
     event::{static_event::StaticEvent, Event, VerifiedEvent},
     listener::{log::Log, membership::MembershipListener},
     principal::{
-        active::{Active, ImportPrekeySecretsError},
+        active::{archive::ActiveArchive, Active, ImportPrekeySecretsError},
         document::{
             id::DocumentId, AddMemberError, DecryptError, DocCausalDecryptionError, Document,
             DocumentState, EncryptError, EncryptedContentWithUpdate, GenerateDocError,
@@ -27,12 +27,14 @@ use crate::{
             op::{
                 add_key::AddKeyOp, rotate_key::RotateKeyOp, AllReachablePrekeyOps, KeyOp, KeyOps,
             },
+            state::PrekeyState,
             Individual, IndividualState, ReceivePrekeyOpError,
         },
         membered::id::MemberedId,
         Principal,
     },
     stats::Stats,
+    store::{Identity, KeyhiveStore, Preliminary},
     transact::{
         fork::ForkAsync,
         merge::{Merge, MergeAsync},
@@ -104,7 +106,8 @@ pub struct Keyhive<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
->(Arc<KeyhiveState<F, S, T, P, C, L, R, K>>);
+    H: KeyhiveStore<F, T>,
+>(Arc<KeyhiveState<F, S, T, P, C, L, R, K, H>>);
 
 /// A keyhive's state: the active identity, the principal tables, and the stores.
 pub struct KeyhiveState<
@@ -116,15 +119,20 @@ pub struct KeyhiveState<
     L: MembershipListener<F, T>,
     R: rand::CryptoRng,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
 > {
     /// The [`Active`] individual. Unlocked: what it mutates is behind its own
     /// locks.
     active: Active<F, S, T, L>,
 
-    /// The [`IndividualState`]s that are known to this replica.
+    /// The [`IndividualState`]s this replica has loaded: its own, those it
+    /// has received, and those it has read from the store since. An
+    /// individual the store holds is loaded the first time it is asked for.
     individuals: Mutex<HashMap<IndividualId, Arc<Mutex<IndividualState>>>>,
 
-    /// The [`DocumentState`]s that are known to this replica.
+    /// The [`DocumentState`]s this replica has loaded, each built from its
+    /// CGKA operations in the store the first time the document is used
+    /// ([`Keyhive::hydrate`]).
     #[allow(clippy::type_complexity)]
     documents: Mutex<HashMap<DocumentId, Arc<Mutex<DocumentState<T>>>>>,
 
@@ -132,8 +140,24 @@ pub struct KeyhiveState<
     /// reader whose invitation (an add of this replica) has not merged yet, or
     /// a relay, which is never added. Operations merge here in causal order
     /// and are served like a held document's. A `Cgka` moves to `documents`
-    /// once an invitation merges.
+    /// once an invitation merges. Loaded from the store like `documents`.
     unjoined: Mutex<HashMap<DocumentId, Cgka<KeylineImplicitRemovesProtocol>>>,
+
+    /// Serializes loading a document's CGKA operations from the store, so two
+    /// uses of a document that is not loaded yet build one CGKA group, not
+    /// two. Taken before any lock on `documents`, `unjoined` or
+    /// `certificate_sets`, and never while holding one of them.
+    hydrating: async_lock::Mutex<()>,
+
+    /// The store this replica reads its persisted state from. It is never
+    /// written to here: see [`crate::store`].
+    store: Arc<H>,
+
+    /// What preparing writes made that no applied write has yet acknowledged
+    /// ([`Keyhive::apply_prepared_encryption`]): a prepare returns all of it,
+    /// so a caller whose transaction rolled back persists it with the next
+    /// attempt.
+    unpersisted: Mutex<Preliminary>,
 
     /// What each CGKA operation's causal past cites. Used for authorizing
     /// CGKA operations that were generated from these certificates. Locked
@@ -167,7 +191,7 @@ pub struct KeyhiveState<
 /// than a snapshot. [`Dupe`] is the same.
 ///
 /// Written by hand: a derive would require `Clone` of every parameter.
-impl<F, S, T, P, C, L, R, K> Clone for Keyhive<F, S, T, P, C, L, R, K>
+impl<F, S, T, P, C, L, R, K, H> Clone for Keyhive<F, S, T, P, C, L, R, K, H>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -177,13 +201,14 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
 {
     fn clone(&self) -> Self {
         Keyhive(self.0.dupe())
     }
 }
 
-impl<F, S, T, P, C, L, R, K> Dupe for Keyhive<F, S, T, P, C, L, R, K>
+impl<F, S, T, P, C, L, R, K, H> Dupe for Keyhive<F, S, T, P, C, L, R, K, H>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -193,13 +218,14 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
 {
     fn dupe(&self) -> Self {
         self.clone()
     }
 }
 
-impl<F, S, T, P, C, L, R, K> std::ops::Deref for Keyhive<F, S, T, P, C, L, R, K>
+impl<F, S, T, P, C, L, R, K, H> std::ops::Deref for Keyhive<F, S, T, P, C, L, R, K, H>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -209,8 +235,9 @@ where
     L: MembershipListener<F, T>,
     R: rand::CryptoRng,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
 {
-    type Target = KeyhiveState<F, S, T, P, C, L, R, K>;
+    type Target = KeyhiveState<F, S, T, P, C, L, R, K, H>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -226,7 +253,8 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > Keyhive<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > Keyhive<F, S, T, P, C, L, R, K, H>
 where
     K::Error: Send + Sync + 'static,
 {
@@ -236,6 +264,8 @@ where
     }
 
     /// A new replica with a fresh active individual.
+    ///
+    /// What this identity holds that `store` must keep is [`Self::identity`].
     ///
     /// This keyhive must be the only writer to the store behind `keyline`.
     /// Moving `keyline` in ensures that for a backend that owns its data, such
@@ -248,6 +278,7 @@ where
         ciphertext_store: C,
         event_listener: L,
         keyline: K,
+        store: H,
         mut csprng: R,
     ) -> Result<Self, SignError> {
         let inner_active = Active::generate(signer, event_listener.clone(), &mut csprng).await?;
@@ -261,6 +292,9 @@ where
             active: inner_active,
             documents: Mutex::new(HashMap::new()),
             unjoined: Mutex::new(HashMap::new()),
+            hydrating: async_lock::Mutex::new(()),
+            store: Arc::new(store),
+            unpersisted: Mutex::new(Preliminary::default()),
             certificate_sets: Mutex::new(CertificateSets::new()),
             pending_events: Mutex::new(Vec::new()),
             ciphertext_store,
@@ -273,6 +307,115 @@ where
             }),
             _plaintext_phantom: PhantomData,
         })))
+    }
+
+    /// Reopen a replica from `store`, loading its identity and its waiting
+    /// events and nothing else: a document's CGKA group is built from its
+    /// operations in `store` the first time the document is used, and an
+    /// individual's prekey operations are read when it is first asked for.
+    /// The certificates are `keyline`'s, and what CGKA operations cite is
+    /// fetched from it as the operations that cite them are loaded.
+    ///
+    /// `store` must hold what [`Self::generate`]d this identity
+    /// ([`Self::identity`]), and what the caller has kept since (see
+    /// [`crate::store`]). As with [`Self::generate`], this keyhive must be the
+    /// only writer to the store behind `keyline`.
+    #[instrument(skip_all)]
+    pub async fn open(
+        signer: S,
+        ciphertext_store: C,
+        event_listener: L,
+        keyline: K,
+        store: H,
+        csprng: R,
+    ) -> Result<Self, OpenError<H::Error>> {
+        let id = IndividualId::try_from(signer.verifying_key())?;
+        let key_pairs = store.load_key_pairs().await.map_err(OpenError::Store)?;
+        let own_ops = store.load_prekey_ops(id).await.map_err(OpenError::Store)?;
+        let individual = individual_from_ops(own_ops).ok_or(OpenError::NoIdentity(id))?;
+        if individual.id() != id {
+            return Err(OpenError::NoIdentity(id));
+        }
+        let active = Active::from_archive(
+            &ActiveArchive {
+                key_pairs,
+                individual,
+            },
+            signer,
+            event_listener.clone(),
+        )?;
+        let pending_events = store
+            .load_pending_events()
+            .await
+            .map_err(OpenError::Store)?
+            .into_iter()
+            .filter_map(|event| match event.verify() {
+                Ok(event) => Some(Arc::new(event)),
+                Err(error) => {
+                    tracing::warn!(%error, "a stored pending event does not verify");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(Keyhive(Arc::new(KeyhiveState {
+            individuals: Mutex::new(HashMap::from_iter([(id, active.individual().dupe())])),
+            active,
+            documents: Mutex::new(HashMap::new()),
+            unjoined: Mutex::new(HashMap::new()),
+            hydrating: async_lock::Mutex::new(()),
+            store: Arc::new(store),
+            unpersisted: Mutex::new(Preliminary::default()),
+            certificate_sets: Mutex::new(CertificateSets::new()),
+            pending_events: Mutex::new(pending_events),
+            ciphertext_store,
+            event_listener,
+            csprng: Arc::new(Mutex::new(csprng)),
+            certificates: Arc::new(Certificates {
+                store: keyline,
+                reconciled: async_lock::Mutex::new(None),
+                cited: SharedCitations::default(),
+            }),
+            _plaintext_phantom: PhantomData,
+        })))
+    }
+
+    /// What this identity holds that the store must keep: every secret key and
+    /// its own prekey operations. A freshly [generated](Self::generate)
+    /// keyhive has announced none of it, so the caller persists this once,
+    /// before it relies on [`Self::open`].
+    pub async fn identity(&self) -> Identity {
+        Identity {
+            key_pairs: self.active.key_pairs.lock().await.clone(),
+            prekey_ops: self
+                .active
+                .individual()
+                .lock()
+                .await
+                .prekey_ops()
+                .values()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The events waiting for a dependency, for the caller to keep with
+    /// [`KeyhiveStore::put_pending_events`] after an ingest, dropping from the
+    /// store with [`KeyhiveStore::drop_pending_events`] those no longer here
+    /// ([`Self::pending_event_hashes`]).
+    ///
+    /// An event waits when it verified and applying it failed for want of
+    /// something that may still arrive: a CGKA operation for a predecessor or
+    /// a cited certificate, an add for a prekey proof, a prekey secret. See
+    /// [`ReceiveStaticEventError::is_missing_dependency`]. Final failures are
+    /// dropped, never kept.
+    pub async fn pending_events(&self) -> Vec<StaticEvent<T>> {
+        self.pending_events
+            .lock()
+            .await
+            .iter()
+            .map(|event| StaticEvent::from(event.as_ref()))
+            .collect()
     }
 
     /// The current [`Active`] Keyhive user.
@@ -712,17 +855,23 @@ where
     async fn prepare_to_write(&self, doc: DocumentId) -> Result<Writing<'_>, EncryptError> {
         let reconciled = self.certificates.reconciled.lock().await;
         let mut fresh = Vec::new();
+        let mut leaf_keys = Vec::new();
         let prepared = async {
             self.reconcile_before_writing(&reconciled, doc, &mut fresh)
                 .await?;
             if self.own_key_is_a_retired_prekey(doc).await {
-                let (op, _) = self.rotate_own_key(doc).await?;
+                let (op, key_pair) = self.rotate_own_key(doc).await?;
                 fresh.push(Arc::new(op));
+                leaf_keys.push(key_pair);
             }
             Ok(())
         }
         .await;
-        let writing = Writing { reconciled, fresh };
+        let writing = Writing {
+            reconciled,
+            fresh,
+            leaf_keys,
+        };
         match prepared {
             Ok(()) => Ok(writing),
             Err(error) => {
@@ -734,11 +883,21 @@ where
 
     /// Release a write's insert lock, then, after dropping the lock,
     /// tell the listener about the CGKA operations it issued.
-    async fn finish_write(&self, writing: Writing<'_>) {
-        let Writing { reconciled, fresh } = writing;
+    ///
+    /// Returns what the write did first, for the caller to persist.
+    async fn finish_write(&self, writing: Writing<'_>) -> Preliminary {
+        let Writing {
+            reconciled,
+            fresh,
+            leaf_keys,
+        } = writing;
         drop(reconciled);
         for op in &fresh {
             self.event_listener.on_cgka_op(op).await;
+        }
+        Preliminary {
+            cgka_ops: fresh,
+            key_pairs: leaf_keys,
         }
     }
 
@@ -1197,21 +1356,29 @@ where
         &self,
         subject: Identifier,
     ) -> Result<BTreeMap<Identifier, ContentHeads<T>>, KeylineStorageError<K::Error>> {
-        let documents: Vec<_> = {
-            self.documents
-                .lock()
-                .await
-                .iter()
-                .map(|(id, state)| (*id, state.dupe()))
-                .collect()
-        };
         let mut retain = BTreeMap::new();
-        for (doc_id, state) in documents {
+        for doc_id in self.known_documents().await {
             let doc = Identifier::from(doc_id);
             if doc != subject && self.positive_power(doc, subject).await?.is_none() {
                 continue;
             }
-            let heads: ContentHeads<T> = state.lock().await.content_heads.iter().cloned().collect();
+            // Only a joined document has heads. A loaded one has them in
+            // memory; for one that is not loaded they are read from the store
+            // without building its CGKA group.
+            let loaded = self.documents.lock().await.get(&doc_id).duped();
+            let heads: ContentHeads<T> = match loaded {
+                Some(state) => state.lock().await.content_heads.iter().cloned().collect(),
+                None => self
+                    .store
+                    .load_content_heads(doc_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the store could not read {doc_id}'s content heads: {error}")
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            };
             // No heads known here: say nothing, rather than "keep none".
             if !heads.is_empty() {
                 retain.insert(doc, heads);
@@ -1566,8 +1733,11 @@ where
 
     #[instrument(skip_all)]
     /// Add an individual to the table. `false`, and nothing changes, if it is
-    /// already there.
+    /// already there, or the store already holds its prekey operations.
     pub async fn register_individual(&self, individual: IndividualState) -> bool {
+        if self.individual_state(individual.id()).await.is_some() {
+            return false;
+        }
         match self.individuals.lock().await.entry(individual.id()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(entry) => {
@@ -1815,9 +1985,40 @@ where
     /// Whether `doc` has a key for `content_ref`. Returns `false` if this replica
     /// has not joined `doc`.
     pub async fn has_key_for(&self, doc: DocumentId, content_ref: &T) -> bool {
-        match self.document_state(doc).await {
-            Some(state) => state.lock().await.has_key_for(content_ref),
-            None => false,
+        let Some(state) = self.document_state(doc).await else {
+            return false;
+        };
+        let mut locked = state.lock().await;
+        self.load_content_keys(doc, &mut locked, std::slice::from_ref(content_ref))
+            .await;
+        locked.has_key_for(content_ref)
+    }
+
+    /// Load into `state` the keys of `refs` that it lacks and the store has
+    /// cached, when a write or a check needs them. A key the store does not
+    /// have stays missing, and a write after it fails with
+    /// [`EncryptContentError::NoKeyForPredecessor`]: a keyhive refers only to
+    /// content it has written or read, and does not derive a key it was never
+    /// given, though for content from an epoch it has access to it could.
+    async fn load_content_keys(&self, doc: DocumentId, state: &mut DocumentState<T>, refs: &[T]) {
+        for content_ref in refs {
+            if state.has_key_for(content_ref) {
+                continue;
+            }
+            let cached = self
+                .store
+                .get_cached_content_key(doc, content_ref)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the store could not read a content key of {doc}: {error}")
+                });
+            if let Some(key) = cached {
+                state.remember_key(AncestorKey::from_trusted_storage(
+                    content_ref.clone(),
+                    doc.into(),
+                    key,
+                ));
+            }
         }
     }
 
@@ -1861,6 +2062,7 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
+            self.load_content_keys(doc, &mut locked, pred_refs).await;
             let ancestors = locked
                 .predecessor_keys(pred_refs)
                 .map_err(EncryptContentError::NoKeyForPredecessor)?;
@@ -1876,7 +2078,7 @@ where
                 .map_err(EncryptContentError::from)
         }
         .await;
-        self.finish_write(writing).await;
+        let preliminary = self.finish_write(writing).await;
         let (encrypted_content, application_secret_key, rotation) = encrypted?;
         let (update_op, local_cgka_secret) = self.record_rotation(rotation).await;
         Ok((
@@ -1884,6 +2086,7 @@ where
                 encrypted_content,
                 update_op,
                 local_cgka_secret,
+                preliminary,
             },
             application_secret_key,
         ))
@@ -1916,6 +2119,7 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
+            self.load_content_keys(doc, &mut locked, pred_refs).await;
             let ancestors = locked
                 .predecessor_keys(pred_refs)
                 .map_err(EncryptContentError::NoKeyForPredecessor)?;
@@ -1931,10 +2135,19 @@ where
                 .map_err(EncryptContentError::from)
         }
         .await;
-        self.finish_write(writing).await;
+        let preliminary = self.finish_write(writing).await;
+        // Kept until a write is applied, so a rolled-back transaction does not
+        // lose them: they are not undone with it.
+        let preliminary = {
+            let mut unpersisted = self.unpersisted.lock().await;
+            unpersisted.cgka_ops.extend(preliminary.cgka_ops);
+            unpersisted.key_pairs.extend(preliminary.key_pairs);
+            unpersisted.clone()
+        };
         Ok(PreparedContent {
             doc,
             encryption: prepared?,
+            preliminary,
         })
     }
 
@@ -1951,16 +2164,35 @@ where
         &self,
         prepared: PreparedContent<T>,
     ) -> Result<(EncryptedContentWithUpdate<T>, SymmetricKey), EncryptContentError<T>> {
-        let PreparedContent { doc, encryption } = prepared;
+        let PreparedContent {
+            doc,
+            encryption,
+            preliminary,
+        } = prepared;
         let handle = self.document_by_id(doc).await?;
         let applied = handle.lock().await.apply_prepared_encryption(encryption);
         let (encrypted_content, application_secret_key, rotation) = applied?;
+        // Applying is the caller's word that it persisted the preparation's
+        // `preliminary`, so later preparations need not repeat it.
+        {
+            let mut unpersisted = self.unpersisted.lock().await;
+            let acknowledged: HashSet<_> =
+                preliminary.cgka_ops.iter().map(|op| op.digest()).collect();
+            unpersisted
+                .cgka_ops
+                .retain(|op| !acknowledged.contains(&op.digest()));
+            unpersisted
+                .key_pairs
+                .retain(|(pk, _)| !preliminary.key_pairs.iter().any(|(acked, _)| acked == pk));
+        }
         let (update_op, local_cgka_secret) = self.record_rotation(rotation).await;
         Ok((
             EncryptedContentWithUpdate {
                 encrypted_content,
                 update_op,
                 local_cgka_secret,
+                // Persisted already: it is what `preliminary` was.
+                preliminary: Preliminary::default(),
             },
             application_secret_key,
         ))
@@ -2625,6 +2857,7 @@ where
             let ops = cgka_ops_for(state.lock().await.cgka());
             return Some(ops);
         }
+        // `document_state` loaded it, if the store has it.
         self.unjoined.lock().await.get(doc).map(cgka_ops_for)
     }
 
@@ -2700,11 +2933,10 @@ where
 
         // Every principal that is sent anything, and everyone this replica knows.
         let mut agents: BTreeSet<Identifier> = self
-            .individuals
-            .lock()
+            .known_individuals()
             .await
-            .keys()
-            .map(|id| (*id).into())
+            .into_iter()
+            .map(Identifier::from)
             .collect();
         agents.insert(active_id);
         agents.extend(sources.keys().copied());
@@ -2751,24 +2983,12 @@ where
         let mut ops: HashMap<Identifier, Vec<Arc<Verified<CgkaOperation>>>> = HashMap::new();
         let mut index: HashMap<Identifier, HashSet<Identifier>> = HashMap::new();
 
-        let docs: Vec<(DocumentId, Arc<Mutex<DocumentState<T>>>)> = {
-            let documents = self.documents.lock().await;
-            documents
-                .iter()
-                .map(|(id, doc)| (*id, doc.dupe()))
-                .collect()
-        };
-        let mut held = Vec::with_capacity(docs.len());
-        for (doc_id, doc) in docs {
-            held.push((doc_id, cgka_ops_for(doc.lock().await.cgka())));
+        let mut held = Vec::new();
+        for doc_id in self.known_documents().await {
+            if let Some(doc_ops) = self.cgka_ops_for_doc(&doc_id).await {
+                held.push((doc_id, doc_ops));
+            }
         }
-        held.extend(
-            self.unjoined
-                .lock()
-                .await
-                .iter()
-                .map(|(doc_id, cgka)| (*doc_id, cgka_ops_for(cgka))),
-        );
 
         for (doc_id, doc_ops) in held {
             if doc_ops.is_empty() {
@@ -2930,7 +3150,120 @@ where
         &self,
         id: IndividualId,
     ) -> Option<Arc<Mutex<IndividualState>>> {
-        self.individuals.lock().await.get(&id).duped()
+        if let Some(loaded) = self.individuals.lock().await.get(&id) {
+            return Some(loaded.dupe());
+        }
+        let ops = self
+            .store
+            .load_prekey_ops(id)
+            .await
+            .unwrap_or_else(|error| panic!("the store could not read {id}'s prekeys: {error}"));
+        let state = individual_from_ops(ops).filter(|state| state.id() == id)?;
+        // Another use may have loaded or received it meanwhile; its state is
+        // the later one.
+        Some(
+            self.individuals
+                .lock()
+                .await
+                .entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(state)))
+                .dupe(),
+        )
+    }
+
+    /// Whether this replica has a CGKA group for `doc_id` in memory, joined or
+    /// not.
+    async fn is_loaded(&self, doc_id: DocumentId) -> bool {
+        self.documents.lock().await.contains_key(&doc_id)
+            || self.unjoined.lock().await.contains_key(&doc_id)
+    }
+
+    /// Make `doc_id`'s CGKA group, if the store holds its operations and this
+    /// replica has not loaded it yet, resident: a document if this replica's
+    /// invitation (or creation) has merged, unjoined otherwise. Its content
+    /// heads come with it. Every use of a document goes through here first,
+    /// so a document nobody uses is never read.
+    ///
+    /// The operations are authorized again as they merge, as an archive's
+    /// are ([`Self::cgka_from_ops`]); one whose certificates have not arrived
+    /// waits in the pending events.
+    ///
+    /// Panics if the store or Keyline cannot answer: there is no state this
+    /// call could fall back to.
+    async fn hydrate(&self, doc_id: DocumentId) {
+        if self.is_loaded(doc_id).await {
+            return;
+        }
+        let _loading = self.hydrating.lock().await;
+        if self.is_loaded(doc_id).await {
+            return;
+        }
+        let ops = self
+            .store
+            .load_cgka_ops(doc_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the store could not read {doc_id}'s CGKA operations: {error}")
+            });
+        if ops.is_empty() {
+            return;
+        }
+        let heads = self
+            .store
+            .load_content_heads(doc_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the store could not read {doc_id}'s content heads: {error}")
+            })
+            .unwrap_or_default();
+        self.install_cgka_ops(doc_id, ops, true, heads.into_iter().collect())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Keyline could not answer for {doc_id}'s CGKA operations: {error}")
+            });
+    }
+
+    /// [`Self::hydrate`] for everything the store holds: every document, and
+    /// every individual. For a full export or a census, which have to look at
+    /// everything.
+    async fn hydrate_all(&self) {
+        let docs = self
+            .store
+            .list_documents()
+            .await
+            .unwrap_or_else(|error| panic!("the store could not list documents: {error}"));
+        for doc in docs {
+            self.hydrate(doc).await;
+        }
+        for id in self.known_individuals().await {
+            self.individual_state(id).await;
+        }
+    }
+
+    /// Every individual this replica has loaded or the store holds.
+    async fn known_individuals(&self) -> BTreeSet<IndividualId> {
+        let mut known: BTreeSet<_> = self.individuals.lock().await.keys().copied().collect();
+        known.extend(
+            self.store
+                .list_individuals()
+                .await
+                .unwrap_or_else(|error| panic!("the store could not list individuals: {error}")),
+        );
+        known
+    }
+
+    /// Every document this replica has loaded or the store holds a CGKA group
+    /// for.
+    async fn known_documents(&self) -> BTreeSet<DocumentId> {
+        let mut known: BTreeSet<_> = self.documents.lock().await.keys().copied().collect();
+        known.extend(self.unjoined.lock().await.keys().copied());
+        known.extend(
+            self.store
+                .list_documents()
+                .await
+                .unwrap_or_else(|error| panic!("the store could not list documents: {error}")),
+        );
+        known
     }
 
     /// This replica's state for a document it is a member of.
@@ -2939,6 +3272,7 @@ where
         &self,
         id: DocumentId,
     ) -> Option<Arc<Mutex<DocumentState<T>>>> {
+        self.hydrate(id).await;
         self.documents.lock().await.get(&id).duped()
     }
 
@@ -2947,12 +3281,14 @@ where
     /// not, such as a relay, a document is a Keyline subject like a group.
     #[instrument(skip_all)]
     pub async fn has_document(&self, id: DocumentId) -> bool {
+        self.hydrate(id).await;
         self.documents.lock().await.contains_key(&id)
     }
 
     /// Whether this replica holds `id`'s CGKA graph, joined or not.
     async fn contains_cgka_graph(&self, id: DocumentId) -> bool {
-        self.has_document(id).await || self.unjoined.lock().await.contains_key(&id)
+        self.hydrate(id).await;
+        self.is_loaded(id).await
     }
 
     /// Whether a group with this id is known: a Keyline subject that is
@@ -2972,7 +3308,7 @@ where
     /// Whether an individual with this id is known.
     #[instrument(skip_all)]
     pub async fn has_individual(&self, id: IndividualId) -> bool {
-        self.individuals.lock().await.contains_key(&id)
+        self.individual_state(id).await.is_some()
     }
 
     /// Receive a prekey operation. It is a [`KeyOp`], so its signature was
@@ -3217,6 +3553,7 @@ where
             let mut sets = self.certificate_sets.lock().await;
             return sets.predecessor_set(locked.cgka(), heads);
         }
+        // `document_state` loaded it, if the store has it.
         let unjoined = self.unjoined.lock().await;
         let cgka = unjoined.get(&doc_id)?;
         let mut sets = self.certificate_sets.lock().await;
@@ -3404,7 +3741,6 @@ where
                         doc_id,
                         cgka,
                         HashSet::new(),
-                        HashSet::new(),
                     )))
                 });
         }
@@ -3457,7 +3793,6 @@ where
                         doc_id,
                         cgka,
                         HashSet::new(),
-                        HashSet::new(),
                     )))
                 }
             };
@@ -3488,8 +3823,9 @@ where
         Ok(true)
     }
 
-    /// Adopt into every held `Cgka` the secrets this identity holds for its own
-    /// keys, as after importing secrets from another instance.
+    /// Adopt into every loaded `Cgka` the secrets this identity holds for its own
+    /// keys, as after importing secrets from another instance. One not loaded
+    /// yet adopts them when it is.
     async fn adopt_all_cgka_secrets(&self) {
         let (me, secrets) = {
             let active = &self.active;
@@ -3534,6 +3870,8 @@ where
     /// [`Archive::encode_zeroizing`].
     #[instrument(skip_all)]
     pub async fn into_archive(&self) -> Result<Archive<T>, KeylineStorageError<K::Error>> {
+        // An export holds everything, so everything is loaded first.
+        self.hydrate_all().await;
         let mut archive = self.archive_state().await;
         archive.certificates = self
             .keyline()
@@ -3544,8 +3882,9 @@ where
         Ok(archive)
     }
 
-    /// [`Self::into_archive`] without the certificate set: what a fork needs,
-    /// since it shares the store.
+    /// [`Self::into_archive`] without the certificate set, and of what is loaded
+    /// only: what a fork needs, since it shares the stores and loads the rest
+    /// from them as it is used.
     async fn archive_state(&self) -> Archive<T> {
         let active = { self.active.into_archive().await };
 
@@ -3606,6 +3945,7 @@ where
         ciphertext_store: C,
         listener: L,
         keyline: K,
+        store: H,
         csprng: Arc<Mutex<R>>,
     ) -> Result<Self, TryFromArchiveError<K::Error>> {
         let certificates = Arc::new(Certificates {
@@ -3619,6 +3959,7 @@ where
             ciphertext_store,
             listener,
             certificates,
+            Arc::new(store),
             csprng,
             true,
         )
@@ -3629,12 +3970,14 @@ where
     /// a fork and its trunk. Without `authorize`, the archived CGKA operations
     /// are applied unchecked, which a fork can do because its trunk checked
     /// them when they arrived.
+    #[allow(clippy::too_many_arguments)]
     async fn from_archive_sharing(
         archive: &Archive<T>,
         signer: S,
         ciphertext_store: C,
         listener: L,
         shared: Arc<Certificates<K>>,
+        store: Arc<H>,
         csprng: Arc<Mutex<R>>,
         authorize: bool,
     ) -> Result<Self, TryFromArchiveError<K::Error>> {
@@ -3674,13 +4017,14 @@ where
             );
         }
 
-        let me = raw_active.id();
-        let secrets = raw_active.key_pairs.lock().await.clone();
         let hive = Keyhive(Arc::new(KeyhiveState {
             active: raw_active,
             individuals: Mutex::new(individuals),
             documents: Mutex::new(HashMap::new()),
             unjoined: Mutex::new(HashMap::new()),
+            hydrating: async_lock::Mutex::new(()),
+            store,
+            unpersisted: Mutex::new(Preliminary::default()),
             certificate_sets: Mutex::new(CertificateSets::new()),
             pending_events: Mutex::new(
                 archive
@@ -3704,107 +4048,135 @@ where
         }));
 
         // Each document's CGKA is rebuilt from its operations, with the
-        // certificates above recorded for its implicit removes protocol. It becomes a
-        // held document if its invitation (or creation) has merged, and
-        // otherwise stays unjoined: awaiting it, or relayed.
+        // certificates above recorded for its implicit removes protocol.
         let mut by_doc: HashMap<DocumentId, Vec<Arc<Verified<CgkaOperation>>>> = HashMap::new();
-        let mut deferred = HashSet::new();
         for signed in archive.cgka_ops.iter().cloned() {
-            let op = match signed.verify() {
-                Ok(op) => Arc::new(op),
-                Err(e) => {
-                    tracing::warn!(error = %e, "an archived CGKA operation does not verify");
-                    continue;
-                }
-            };
-            if !hive.record_citations(op.payload()).await? {
-                // Kept, to apply once the certificate arrives.
-                deferred.insert(op.digest());
-                hive.pending_events
-                    .lock()
-                    .await
-                    .push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
-                continue;
+            match signed.verify() {
+                Ok(op) => by_doc
+                    .entry(DocumentId::from(op.payload().doc_id))
+                    .or_default()
+                    .push(Arc::new(op)),
+                Err(e) => tracing::warn!(error = %e, "an archived CGKA operation does not verify"),
             }
-            let doc_id = DocumentId::from(op.payload().doc_id);
-            by_doc.entry(doc_id).or_default().push(op);
         }
-        let mut documents = HashMap::new();
-        let mut unjoined = HashMap::new();
         for (doc_id, ops) in by_doc {
-            let invitations: HashSet<_> = ops
-                .iter()
-                .filter(|op| invites(op.payload(), me))
-                .map(|op| op.digest())
-                .collect();
-            let RebuiltCgka {
-                cgka,
-                authorization_pending,
-                mut unapplied,
-            } = hive
-                .cgka_from_ops(doc_id, ops, me, &secrets, authorize)
-                .await?;
-            for op in authorization_pending {
-                deferred.insert(op.digest());
-                hive.pending_events
-                    .lock()
-                    .await
-                    .push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
-            }
-            // Operations that descend from a deferred operation are deferred with it.
-            let mut has_progressed = true;
-            while has_progressed {
-                has_progressed = false;
-                let mut pending = hive.pending_events.lock().await;
-                unapplied.retain(|op| {
-                    let should_wait = op
-                        .payload()
-                        .predecessors()
-                        .iter()
-                        .any(|p| deferred.contains(p));
-                    if should_wait {
-                        deferred.insert(op.digest());
-                        pending.push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
-                        has_progressed = true;
-                    }
-                    !should_wait
-                });
-            }
-            for op in &unapplied {
-                tracing::warn!(
-                    %doc_id,
-                    op = %op.digest(),
-                    "an archived operation's predecessors are missing or did not apply"
-                );
-            }
-            if invitations.is_empty() || !cgka.contains_all(&invitations) {
-                unjoined.insert(doc_id, cgka);
-                continue;
-            }
-            let mut doc = DocumentState::with_cgka(doc_id, cgka, HashSet::new(), HashSet::new());
-            if let Some(archived) = archive.docs.get(&doc_id) {
-                doc.content_heads = archived.content_heads.clone();
-                doc.content_state = archived.content_state.clone();
+            let archived = archive.docs.get(&doc_id);
+            let heads = archived
+                .map(|archived| archived.content_heads.clone())
+                .unwrap_or_default();
+            let joined = hive.install_cgka_ops(doc_id, ops, authorize, heads).await?;
+            if let (Some(doc), Some(archived)) = (joined, archived) {
+                let mut locked = doc.lock().await;
                 for (content_ref, key) in &archived.content_keys {
-                    doc.remember_key(AncestorKey::from_trusted_storage(
+                    locked.remember_key(AncestorKey::from_trusted_storage(
                         content_ref.clone(),
                         doc_id.into(),
                         key.clone(),
                     ));
                 }
             }
-            documents.insert(doc_id, Arc::new(Mutex::new(doc)));
         }
         for doc_id in archive.docs.keys() {
-            if documents.contains_key(doc_id) {
+            if hive.documents.lock().await.contains_key(doc_id) {
                 continue;
             }
             tracing::warn!(%doc_id, "the archived CGKA graph does not rebuild from its operations");
         }
-        *hive.documents.lock().await = documents;
-        *hive.unjoined.lock().await = unjoined;
 
         Ok(hive)
+    }
+
+    /// Build `doc_id`'s CGKA group from `ops` (all its operations that this
+    /// replica holds) and make it resident: a document with `content_heads`
+    /// if this replica's invitation (or creation) has merged, unjoined
+    /// otherwise (awaiting it, or relayed). Returns the document if there is
+    /// one.
+    ///
+    /// An operation citing a certificate Keyline lacks, one that is pending
+    /// authorization, and every operation built on either waits among the
+    /// pending events. Without `authorize` the operations are applied
+    /// unchecked: a fork can, as its trunk checked them when they arrived.
+    #[allow(clippy::type_complexity)]
+    async fn install_cgka_ops(
+        &self,
+        doc_id: DocumentId,
+        ops: Vec<Arc<Verified<CgkaOperation>>>,
+        authorize: bool,
+        content_heads: HashSet<T>,
+    ) -> Result<Option<Arc<Mutex<DocumentState<T>>>>, KeylineStorageError<K::Error>> {
+        let me = self.active.id();
+        let secrets = self.active.key_pairs.lock().await.clone();
+
+        let mut deferred = HashSet::new();
+        let mut citable = Vec::with_capacity(ops.len());
+        for op in ops {
+            if self.record_citations(op.payload()).await? {
+                citable.push(op);
+            } else {
+                // Kept, to apply once the certificate arrives.
+                deferred.insert(op.digest());
+                self.pending_events
+                    .lock()
+                    .await
+                    .push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
+            }
+        }
+        let invitations: HashSet<_> = citable
+            .iter()
+            .filter(|op| invites(op.payload(), me))
+            .map(|op| op.digest())
+            .collect();
+        let RebuiltCgka {
+            cgka,
+            authorization_pending,
+            mut unapplied,
+        } = self
+            .cgka_from_ops(doc_id, citable, me, &secrets, authorize)
+            .await?;
+        for op in authorization_pending {
+            deferred.insert(op.digest());
+            self.pending_events
+                .lock()
+                .await
+                .push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
+        }
+        // Operations that descend from a deferred operation are deferred with it.
+        let mut has_progressed = true;
+        while has_progressed {
+            has_progressed = false;
+            let mut pending = self.pending_events.lock().await;
+            unapplied.retain(|op| {
+                let should_wait = op
+                    .payload()
+                    .predecessors()
+                    .iter()
+                    .any(|p| deferred.contains(p));
+                if should_wait {
+                    deferred.insert(op.digest());
+                    pending.push(Arc::new(VerifiedEvent::CgkaOperation(op.dupe())));
+                    has_progressed = true;
+                }
+                !should_wait
+            });
+        }
+        for op in &unapplied {
+            tracing::warn!(
+                %doc_id,
+                op = %op.digest(),
+                "a stored operation's predecessors are missing or did not apply"
+            );
+        }
+        if invitations.is_empty() || !cgka.contains_all(&invitations) {
+            self.unjoined.lock().await.insert(doc_id, cgka);
+            return Ok(None);
+        }
+        let doc = Arc::new(Mutex::new(DocumentState::with_cgka(
+            doc_id,
+            cgka,
+            content_heads,
+        )));
+        self.documents.lock().await.insert(doc_id, doc.dupe());
+        Ok(Some(doc))
     }
 
     #[allow(clippy::type_complexity)]
@@ -3829,6 +4201,8 @@ where
             .chain(std::iter::once(archive.active.individual));
         for indie in archived {
             let id = indie.id();
+            // Load ours first, so the merge is into everything the store holds.
+            self.individual_state(id).await;
             let mut locked_indies = self.individuals.lock().await;
             if let Some(our_indie) = locked_indies.get_mut(&id) {
                 our_indie.merge_async(indie).await;
@@ -3957,7 +4331,10 @@ where
         Ok(())
     }
 
+    /// Counts of everything this replica holds. A census looks at everything,
+    /// so it loads every document and individual the store holds.
     pub async fn stats(&self) -> Stats {
+        self.hydrate_all().await;
         let active_prekey_count = self.active.individual.lock().await.prekey_ops().len() as u64;
 
         // Count prekeys_expanded and prekey_rotations across all individuals
@@ -4134,7 +4511,8 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > Debug for KeyhiveState<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > Debug for KeyhiveState<F, S, T, P, C, L, R, K, H>
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("KeyhiveState")
@@ -4156,7 +4534,8 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > Debug for Keyhive<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > Debug for Keyhive<F, S, T, P, C, L, R, K, H>
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         self.0.fmt(f)
@@ -4172,12 +4551,13 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore + Clone,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > ForkAsync for Keyhive<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > ForkAsync for Keyhive<F, S, T, P, C, L, R, K, H>
 where
     Log<T>: MembershipListener<F, T>,
     K::Error: Send + Sync + 'static,
 {
-    type AsyncForked = Keyhive<F, S, T, P, C, Log<T>, R, K>;
+    type AsyncForked = Keyhive<F, S, T, P, C, Log<T>, R, K, H>;
 
     /// A fork for [`transact_async`](crate::transact::transact_async). It
     /// copies this keyhive's state but _shares its Keyline store_, so a
@@ -4207,6 +4587,7 @@ where
             self.ciphertext_store.clone(),
             Log::new(),
             self.certificates.dupe(),
+            self.store.dupe(),
             self.csprng.clone(),
             false,
         )
@@ -4224,7 +4605,8 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore + Clone,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > MergeAsync for Arc<Mutex<Keyhive<F, S, T, P, C, L, R, K>>>
+        H: KeyhiveStore<F, T>,
+    > MergeAsync for Arc<Mutex<Keyhive<F, S, T, P, C, L, R, K, H>>>
 where
     Log<T>: MembershipListener<F, T>,
     K::Error: Send + Sync + 'static,
@@ -4243,12 +4625,13 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore + Clone,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > Keyhive<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > Keyhive<F, S, T, P, C, L, R, K, H>
 where
     Log<T>: MembershipListener<F, T>,
     K::Error: Send + Sync + 'static,
 {
-    async fn absorb_fork(&self, fork: Keyhive<F, S, T, P, C, Log<T>, R, K>) {
+    async fn absorb_fork(&self, fork: Keyhive<F, S, T, P, C, Log<T>, R, K, H>) {
         let forked_active = { fork.active.clone() };
         self.active.merge_async(forked_active).await;
 
@@ -4341,7 +4724,8 @@ impl<
         L: MembershipListener<F, T>,
         R: rand::CryptoRng + rand::RngCore,
         K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
-    > Verifiable for Keyhive<F, S, T, P, C, L, R, K>
+        H: KeyhiveStore<F, T>,
+    > Verifiable for Keyhive<F, S, T, P, C, L, R, K, H>
 {
     fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
         self.active.verifying_key()
@@ -4423,6 +4807,23 @@ impl<F: FutureForm, T: ContentRef, P, C: CiphertextStore<F, T, P>>
     fn from(error: DocCausalDecryptionError<F, T, P, C>) -> Self {
         CausalDecryptError::Document(Box::new(error))
     }
+}
+
+/// Why a keyhive could not be opened from its store.
+#[derive(Debug, Error)]
+pub enum OpenError<E: core::error::Error + 'static> {
+    /// The signer's key is not a valid id.
+    #[error("the signer's key is not a valid id: {0}")]
+    InvalidSigner(#[from] InvalidIdentifier),
+
+    /// The store holds no prekey operations signed by the signer: it was not
+    /// given this identity's [`Keyhive::identity`].
+    #[error("the store holds no identity for {0}")]
+    NoIdentity(IndividualId),
+
+    /// The store failed.
+    #[error("the store failed: {0}")]
+    Store(E),
 }
 
 /// Why an archive could not be loaded.
@@ -4715,6 +5116,10 @@ fn never_merges(error: &CgkaError) -> bool {
 struct Writing<'a> {
     reconciled: Reconciled<'a>,
     fresh: Vec<Arc<Verified<CgkaOperation>>>,
+
+    /// The key pairs sampled for rotations among `fresh`, which no listener
+    /// is given.
+    leaf_keys: Vec<LeafKeyPair>,
 }
 
 /// The held insert lock ([`Certificates::reconciled`]). A function that
@@ -4782,6 +5187,7 @@ enum CgkaUnauthorized {
 pub struct PreparedContent<T: ContentRef> {
     doc: DocumentId,
     encryption: PreparedEncryption<T>,
+    preliminary: Preliminary,
 }
 
 impl<T: ContentRef> std::fmt::Debug for PreparedContent<T> {
@@ -4789,11 +5195,29 @@ impl<T: ContentRef> std::fmt::Debug for PreparedContent<T> {
         f.debug_struct("PreparedContent")
             .field("doc", &self.doc)
             .field("encryption", &self.encryption)
+            .field("preliminary", &self.preliminary)
             .finish()
     }
 }
 
 impl<T: ContentRef> PreparedContent<T> {
+    /// The document written to.
+    pub fn doc(&self) -> DocumentId {
+        self.doc
+    }
+
+    /// What this write did to bring the document up to date for writing,
+    /// and anything an earlier preparation did that no applied write has
+    /// acknowledged yet. Persist it in the transaction that persists this
+    /// write: it is part of this replica's state whether or not the write is
+    /// applied, and it is not repeated once a write applies.
+    ///
+    /// A rotation among it was announced to the listener when it was made,
+    /// and its secret reaches nothing but here.
+    pub fn preliminary(&self) -> &Preliminary {
+        &self.preliminary
+    }
+
     pub fn encrypted_content(&self) -> &EncryptedContent<Vec<u8>, T> {
         self.encryption.encrypted_content()
     }
@@ -4825,6 +5249,16 @@ pub enum EncryptContentError<T: ContentRef> {
     /// written that content or read it.
     #[error("no key for predecessor {0:?}")]
     NoKeyForPredecessor(T),
+}
+
+/// The individual whose prekey operations `ops` are, or `None` if there are
+/// none or they were not all signed by one individual.
+fn individual_from_ops(ops: Vec<Arc<KeyOp>>) -> Option<IndividualState> {
+    let mut ops = ops.into_iter();
+    let first = ops.next()?;
+    let mut state = PrekeyState::new(Arc::unwrap_or_clone(first));
+    state.extend(ops.map(Arc::unwrap_or_clone));
+    IndividualState::try_from(state).ok()
 }
 
 /// Whether `cert` is a delegation of less than `Read` power.
@@ -4860,6 +5294,7 @@ mod tests {
         NoListener,
         rand::rngs::OsRng,
         MemoryKeyline<ContentHeads<[u8; 32]>>,
+        crate::store::memory::MemoryKeyhiveStore<[u8; 32]>,
     >;
 
     // `Hive` (in-memory store, no listener, `OsRng`) is a cheap `Dupe`: an O(1)
@@ -4875,6 +5310,7 @@ mod tests {
             Arc::new(Mutex::new(store)),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             rand::rngs::OsRng,
         )
         .await
@@ -5560,6 +5996,7 @@ mod tests {
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await?;
@@ -5628,6 +6065,7 @@ mod tests {
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await?;
@@ -5739,6 +6177,7 @@ mod tests {
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await?;
@@ -5794,6 +6233,7 @@ mod tests {
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await?;
@@ -5835,6 +6275,7 @@ mod tests {
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await?;
@@ -5872,12 +6313,13 @@ mod tests {
 
         let sk = MemorySigner::generate(&mut csprng);
         let store = Arc::new(Mutex::new(MemoryCiphertextStore::<[u8; 32], String>::new()));
-        let hive: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _> =
+        let hive: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _, _> =
             Keyhive::generate(
                 sk.clone(),
                 store.clone(),
                 NoListener,
                 MemoryKeyline::new(),
+                crate::store::memory::MemoryKeyhiveStore::default(),
                 rand::rngs::OsRng,
             )
             .await?;
@@ -5927,12 +6369,14 @@ mod tests {
             NoListener,
             _,
             _,
+            _,
         > = Keyhive::try_from_archive(
             &archive,
             sk,
             store,
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await
@@ -5990,12 +6434,13 @@ mod tests {
         let mut csprng = rand::rngs::OsRng;
         let sk = MemorySigner::generate(&mut csprng);
         let store = Arc::new(Mutex::new(MemoryCiphertextStore::<[u8; 32], String>::new()));
-        let kh: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _> =
+        let kh: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _, _> =
             Keyhive::generate(
                 sk.clone(),
                 store.clone(),
                 NoListener,
                 MemoryKeyline::new(),
+                crate::store::memory::MemoryKeyhiveStore::default(),
                 rand::rngs::OsRng,
             )
             .await?;
@@ -6012,13 +6457,14 @@ mod tests {
 
         // Create an archive and try to load it into a fresh Keyhive
         let archive = kh.into_archive().await?;
-        let kh2: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _> =
+        let kh2: Keyhive<Sendable, MemorySigner, [u8; 32], String, _, NoListener, _, _, _> =
             Keyhive::try_from_archive(
                 &archive,
                 sk,
                 Arc::new(Mutex::new(MemoryCiphertextStore::<[u8; 32], String>::new())),
                 NoListener,
                 MemoryKeyline::new(),
+                crate::store::memory::MemoryKeyhiveStore::default(),
                 Arc::new(Mutex::new(rand::rngs::OsRng)),
             )
             .await?;
@@ -6985,7 +7431,7 @@ mod tests {
 
         transact_async(
             &trunk,
-            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _>| async move {
+            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _, _>| async move {
                 fork.try_encrypt_content(doc, &[2u8; 32], &[], b"in the fork")
                     .await
                     .map_err(|e| e.to_string())?;
@@ -7014,7 +7460,7 @@ mod tests {
 
         transact_async(
             &trunk,
-            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _>| async move {
+            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _, _>| async move {
                 let members = fork
                     .cgka_members_for(doc)
                     .await
@@ -7057,11 +7503,12 @@ mod tests {
         test_utils::init_logging();
 
         let sk = MemorySigner::generate(&mut rand::rngs::OsRng);
-        let hive = Keyhive::<Sendable, _, [u8; 32], Vec<u8>, _, NoListener, _, _>::generate(
+        let hive = Keyhive::<Sendable, _, [u8; 32], Vec<u8>, _, NoListener, _, _, _>::generate(
             sk,
             Arc::new(Mutex::new(MemoryCiphertextStore::new())),
             NoListener,
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             rand::rngs::OsRng,
         )
         .await?;
@@ -7099,7 +7546,7 @@ mod tests {
 
         let tx = transact_async(
             &trunk,
-            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _>| async move {
+            |fork: Keyhive<Sendable, _, _, _, _, Log<[u8; 32]>, _, _, _>| async move {
                 // Depending on when the async runs
                 let init_doc_count = fork.documents.lock().await.len();
                 assert!(init_doc_count == 1 || init_doc_count == 2);

@@ -123,6 +123,7 @@ mod tests {
         Log<[u8; 32]>,
         OsRng,
         MemoryKeyline<ContentHeads<[u8; 32]>>,
+        crate::store::memory::MemoryKeyhiveStore<[u8; 32]>,
     > {
         let store: MemoryCiphertextStore<[u8; 32], Vec<u8>> = MemoryCiphertextStore::new();
         Keyhive::generate(
@@ -130,6 +131,7 @@ mod tests {
             Arc::new(Mutex::new(store)),
             log.clone(),
             MemoryKeyline::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             OsRng,
         )
         .await

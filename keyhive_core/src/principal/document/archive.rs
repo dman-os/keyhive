@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentArchive<T: ContentRef> {
     pub(crate) content_heads: HashSet<T>,
-    pub(crate) content_state: HashSet<T>,
     pub(crate) content_keys: HashMap<T, SymmetricKey>,
 }
 
@@ -24,16 +23,13 @@ impl<T: ContentRef> DocumentArchive<T> {
         /// A content key's length.
         const KEY_LEN: usize = 32;
 
-        refs_len(self.content_heads.iter(), 0)
-            + refs_len(self.content_state.iter(), 0)
-            + refs_len(self.content_keys.keys(), KEY_LEN)
+        refs_len(self.content_heads.iter(), 0) + refs_len(self.content_keys.keys(), KEY_LEN)
     }
 
     /// The [`Encode`] layout, below. The only place it is written: into a
     /// `Vec` to encode, and into a wiped buffer to store an archive.
     pub(crate) fn write_into<S: Sink>(&self, out: &mut S) {
         write_refs(self.content_heads.iter().map(|r| (r, &[][..])), out);
-        write_refs(self.content_state.iter().map(|r| (r, &[][..])), out);
         write_refs(
             self.content_keys.iter().map(|(r, k)| (r, k.as_slice())),
             out,
@@ -41,7 +37,7 @@ impl<T: ContentRef> DocumentArchive<T> {
     }
 }
 
-/// `content_heads ‖ content_state ‖ content_keys`, each a count and then its
+/// `content_heads ‖ content_keys`, each a count and then its
 /// entries in ascending order of their refs' encodings. An entry is a ref,
 /// followed in `content_keys` by its 32-byte key. Content refs need not be
 /// ordered, but their bytes are.
@@ -63,7 +59,6 @@ impl<T: ContentRef> Decode for DocumentArchive<T> {
 impl<T: ContentRef> StreamDecode for DocumentArchive<T> {
     fn decode_next(bytes: &[u8]) -> Result<(Self, &[u8]), DecodeError> {
         let (content_heads, rest) = decode_refs(bytes, |rest| Ok(((), rest)))?;
-        let (content_state, rest) = decode_refs(rest, |rest| Ok(((), rest)))?;
         let (content_keys, rest) = decode_refs(rest, |rest| {
             let (key, rest) = rest
                 .split_first_chunk::<32>()
@@ -73,7 +68,6 @@ impl<T: ContentRef> StreamDecode for DocumentArchive<T> {
         Ok((
             DocumentArchive {
                 content_heads: content_heads.into_iter().map(|(r, ())| r).collect(),
-                content_state: content_state.into_iter().map(|(r, ())| r).collect(),
                 content_keys: content_keys.into_iter().collect(),
             },
             rest,
@@ -146,7 +140,6 @@ mod tests {
     fn content_keys_round_trip_with_their_refs() {
         let archive = DocumentArchive::<[u8; 32]> {
             content_heads: HashSet::new(),
-            content_state: HashSet::new(),
             content_keys: (0..8u8)
                 .map(|n| ([n; 32], SymmetricKey::from([n.wrapping_add(100); 32])))
                 .collect(),
@@ -161,12 +154,10 @@ mod tests {
     /// tag), from a pair of arbitrary values.
     fn archive_of(
         heads: &HashSet<Option<u32>>,
-        state: &HashSet<Option<u32>>,
         keys: &[(Option<u32>, [u8; 32])],
     ) -> DocumentArchive<Option<u32>> {
         DocumentArchive {
             content_heads: heads.clone(),
-            content_state: state.clone(),
             content_keys: keys
                 .iter()
                 .map(|(r, k)| (*r, SymmetricKey::from(k)))
@@ -185,13 +176,9 @@ mod tests {
     #[test]
     fn the_encoded_length_is_exact() {
         bolero::check!()
-            .with_type::<(
-                HashSet<Option<u32>>,
-                HashSet<Option<u32>>,
-                Vec<(Option<u32>, [u8; 32])>,
-            )>()
-            .for_each(|(heads, state, keys)| {
-                assert_length_is_exact(&archive_of(heads, state, keys));
+            .with_type::<(HashSet<Option<u32>>, Vec<(Option<u32>, [u8; 32])>)>()
+            .for_each(|(heads, keys)| {
+                assert_length_is_exact(&archive_of(heads, keys));
             });
     }
 
@@ -200,6 +187,6 @@ mod tests {
     fn the_encoded_length_is_exact_for_multi_byte_counts() {
         let refs: HashSet<_> = (0..300u32).map(Some).collect();
         let keys: Vec<_> = (0..300u32).map(|n| (Some(n * 1000), [7; 32])).collect();
-        assert_length_is_exact(&archive_of(&refs, &refs, &keys));
+        assert_length_is_exact(&archive_of(&refs, &keys));
     }
 }

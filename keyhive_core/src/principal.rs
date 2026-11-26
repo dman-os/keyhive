@@ -21,7 +21,7 @@ use self::{
 };
 use crate::{
     certificate::KeylineStorageError, content::heads::ContentHeads, keyhive::Keyhive,
-    listener::membership::MembershipListener,
+    listener::membership::MembershipListener, store::KeyhiveStore,
 };
 use future_form::FutureForm;
 use keyhive_codec::traits::Decode;
@@ -56,7 +56,7 @@ impl<KH> Principal<KH> {
     }
 }
 
-impl<F, S, T, P, C, L, R, K> Principal<Keyhive<F, S, T, P, C, L, R, K>>
+impl<F, S, T, P, C, L, R, K, H> Principal<Keyhive<F, S, T, P, C, L, R, K, H>>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -66,6 +66,7 @@ where
     L: MembershipListener<F, T>,
     R: CryptoRng + RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     /// Whether this is the active identity.
@@ -74,20 +75,21 @@ where
     }
 
     /// As an individual, if this replica holds its prekeys.
-    pub async fn as_individual(&self) -> Option<Individual<Keyhive<F, S, T, P, C, L, R, K>>> {
+    pub async fn as_individual(&self) -> Option<Individual<Keyhive<F, S, T, P, C, L, R, K, H>>> {
         self.keyhive.get_individual(IndividualId(self.id)).await
     }
 
     /// As a document, if this replica holds an authorized key agreement
     /// operation for it.
-    pub async fn as_document(&self) -> Option<Document<Keyhive<F, S, T, P, C, L, R, K>>> {
+    pub async fn as_document(&self) -> Option<Document<Keyhive<F, S, T, P, C, L, R, K, H>>> {
         self.keyhive.get_document(DocumentId(self.id)).await
     }
 
     /// As a group: a Keyline subject that is neither of the others.
     pub async fn as_group(
         &self,
-    ) -> Result<Option<Group<Keyhive<F, S, T, P, C, L, R, K>>>, KeylineStorageError<K::Error>> {
+    ) -> Result<Option<Group<Keyhive<F, S, T, P, C, L, R, K, H>>>, KeylineStorageError<K::Error>>
+    {
         self.keyhive.get_group(GroupId(self.id)).await
     }
 

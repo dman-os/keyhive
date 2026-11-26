@@ -11,6 +11,7 @@ use crate::{
     keyhive::Keyhive,
     listener::membership::MembershipListener,
     principal::{group::RevokeMemberError, membered::id::MemberedId},
+    store::{KeyhiveStore, Preliminary},
     update::{AddMemberUpdate, RevokeMemberUpdate},
 };
 use beekem::{
@@ -55,7 +56,6 @@ use tracing::instrument;
 pub struct DocumentState<T: ContentRef> {
     id: DocumentId,
     pub(crate) content_heads: HashSet<T>,
-    pub(crate) content_state: HashSet<T>,
 
     /// Keys for content this document has written or read through its CGKA
     /// group or a traversal. Each one encrypted or decrypted a block whose
@@ -76,12 +76,10 @@ impl<T: ContentRef> DocumentState<T> {
         id: DocumentId,
         cgka: Cgka<KeylineImplicitRemovesProtocol>,
         content_heads: HashSet<T>,
-        content_state: HashSet<T>,
     ) -> Self {
         DocumentState {
             id,
             content_heads,
-            content_state,
             known_decryption_keys: HashMap::new(),
             cgka,
         }
@@ -148,12 +146,7 @@ impl<T: ContentRef> DocumentState<T> {
             cgka.update(owner_pk, owner_sk, signer, csprng).await?;
         ops.push(update_op);
 
-        let doc = DocumentState::with_cgka(
-            id,
-            cgka,
-            initial_content_heads.into_iter().collect(),
-            HashSet::new(),
-        );
+        let doc = DocumentState::with_cgka(id, cgka, initial_content_heads.into_iter().collect());
         Ok((doc, ops))
     }
 
@@ -445,7 +438,6 @@ where {
     pub fn into_archive(&self) -> DocumentArchive<T> {
         DocumentArchive {
             content_heads: self.content_heads.clone(),
-            content_state: self.content_state.clone(),
             content_keys: self
                 .known_decryption_keys
                 .iter()
@@ -482,7 +474,7 @@ impl<KH> Document<KH> {
     }
 }
 
-impl<F, S, T, P, C, L, R, K> Document<Keyhive<F, S, T, P, C, L, R, K>>
+impl<F, S, T, P, C, L, R, K, H> Document<Keyhive<F, S, T, P, C, L, R, K, H>>
 where
     F: FutureForm,
     S: AsyncSigner<F> + Clone,
@@ -492,6 +484,7 @@ where
     L: MembershipListener<F, T>,
     R: CryptoRng + RngCore,
     K: Keyline<F, RetentionWatermark = ContentHeads<T>>,
+    H: KeyhiveStore<F, T>,
     K::Error: Send + Sync + 'static,
 {
     /// The live delegations about this document: its direct members.
@@ -706,6 +699,7 @@ pub struct EncryptedContentWithUpdate<T: ContentRef> {
     pub(crate) encrypted_content: EncryptedContent<Vec<u8>, T>,
     pub(crate) update_op: Option<Verified<CgkaOperation>>,
     pub(crate) local_cgka_secret: Option<LeafKeyPair>,
+    pub(crate) preliminary: Preliminary,
 }
 
 impl<T: ContentRef> EncryptedContentWithUpdate<T> {
@@ -726,6 +720,12 @@ impl<T: ContentRef> EncryptedContentWithUpdate<T> {
     /// caller that persists incrementally must store it with the update.
     pub fn local_cgka_secret(&self) -> Option<&LeafKeyPair> {
         self.local_cgka_secret.as_ref()
+    }
+
+    /// What the write did to bring the document up to date for writing, that
+    /// the caller must persist along with [`Self::update_op`].
+    pub fn preliminary(&self) -> &Preliminary {
+        &self.preliminary
     }
 }
 

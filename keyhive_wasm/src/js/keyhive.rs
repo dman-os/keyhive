@@ -78,6 +78,7 @@ pub type InnerKeyhive = Keyhive<
     JsEventHandler,
     OsRng,
     MemoryKeyline<ContentHeads<JsChangeId>>,
+    keyhive_core::store::memory::MemoryKeyhiveStore<JsChangeId>,
 >;
 
 #[wasm_bindgen(js_name = Keyhive)]
@@ -107,6 +108,7 @@ impl JsKeyhive {
                 ciphertext_store.clone(),
                 JsEventHandler(event_handler.clone()),
                 MemoryKeyline::new(),
+                keyhive_core::store::memory::MemoryKeyhiveStore::default(),
                 OsRng,
             )
             .await?,

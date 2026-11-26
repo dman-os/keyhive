@@ -61,6 +61,7 @@ pub type Hive = Keyhive<
     NoListener,
     rand::rngs::OsRng,
     KeylineStore,
+    crate::store::memory::MemoryKeyhiveStore<[u8; 32]>,
 >;
 
 /// The Keyline store each test keyhive holds.
@@ -516,12 +517,13 @@ impl TestContext {
             .ok_or("that archive's identity was not created by this TestContext")?
             .clone();
         let store = Store::new();
-        let hive = Keyhive::<Sendable, _, _, _, _, _, _, _>::try_from_archive(
+        let hive = Keyhive::<Sendable, _, _, _, _, _, _, _, _>::try_from_archive(
             archive,
             signer,
             store.clone(),
             NoListener,
             KeylineStore::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             Arc::new(Mutex::new(rand::rngs::OsRng)),
         )
         .await
@@ -959,6 +961,7 @@ impl TestContext {
             store.clone(),
             NoListener,
             KeylineStore::new(),
+            crate::store::memory::MemoryKeyhiveStore::default(),
             rand::rngs::OsRng,
         )
         .await?;

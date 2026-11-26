@@ -33,9 +33,11 @@ async fn a_reserved_identity_becomes_the_document_id() -> Result<()> {
     let encrypted = alice
         .try_encrypt_content(doc, &content_ref(content), &[], content)
         .await?;
-    assert!(alice
-        .can_decrypt_content(doc, encrypted.encrypted_content())
-        .await?);
+    assert!(
+        alice
+            .can_decrypt_content(doc, encrypted.encrypted_content())
+            .await?
+    );
     Ok(())
 }
 

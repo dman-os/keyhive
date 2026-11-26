@@ -326,19 +326,21 @@ async fn own_cgka_graph_converges_with_creators_ops(bob_sorts_first: bool) -> Te
         (second, first)
     };
 
-    let alice = Keyhive::<Sendable, _, _, _, _, _, _, _>::generate(
+    let alice = Keyhive::<Sendable, _, _, _, _, _, _, _, _>::generate(
         alice_signer,
         MemoryCiphertextStore::<[u8; 32], Vec<u8>>::new(),
         NoListener,
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await?;
-    let bob = Keyhive::<Sendable, _, _, _, _, _, _, _>::generate(
+    let bob = Keyhive::<Sendable, _, _, _, _, _, _, _, _>::generate(
         bob_signer.clone(),
         MemoryCiphertextStore::<[u8; 32], Vec<u8>>::new(),
         NoListener,
         MemoryKeyline::new(),
+        keyhive_core::store::memory::MemoryKeyhiveStore::default(),
         OsRng,
     )
     .await?;

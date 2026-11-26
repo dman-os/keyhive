@@ -13,7 +13,12 @@ async fn a_write_that_rotates_the_leaf_returns_the_new_secret() -> Result<()> {
     ctx.sync(&alice, &bob).await?;
 
     let mut rotations = 0;
-    for (writer, content) in [(&alice, b"a1"), (&bob, b"b1"), (&alice, b"a2"), (&bob, b"b2")] {
+    for (writer, content) in [
+        (&alice, b"a1"),
+        (&bob, b"b1"),
+        (&alice, b"a2"),
+        (&bob, b"b2"),
+    ] {
         let written = writer
             .try_encrypt_content(doc, &content_ref(content), &[], content)
             .await?;
@@ -29,8 +34,15 @@ async fn a_write_that_rotates_the_leaf_returns_the_new_secret() -> Result<()> {
                 secret.is_some()
             ),
         }
-        ctx.sync(writer, if std::ptr::eq(writer, &alice) { &bob } else { &alice })
-            .await?;
+        ctx.sync(
+            writer,
+            if std::ptr::eq(writer, &alice) {
+                &bob
+            } else {
+                &alice
+            },
+        )
+        .await?;
     }
     assert!(rotations > 0, "some write had to rotate its leaf");
     Ok(())

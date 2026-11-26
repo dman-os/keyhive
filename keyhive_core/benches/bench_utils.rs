@@ -22,6 +22,7 @@ pub type BenchKeyhive = Keyhive<
     NoListener,
     OsRng,
     MemoryKeyline<ContentHeads<[u8; 32]>>,
+    keyhive_core::store::memory::MemoryKeyhiveStore<[u8; 32]>,
 >;
 pub struct Scenario {
     pub keyhive: BenchKeyhive,
