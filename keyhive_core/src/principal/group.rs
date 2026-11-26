@@ -11,7 +11,7 @@ use crate::{
     keyhive::Keyhive,
     listener::membership::MembershipListener,
     principal::document::AddMemberError,
-    store::KeyhiveStore,
+    store::{HydrateError, KeyhiveStore},
     update::{AddMemberUpdate, RevokeMemberUpdate},
 };
 use beekem::error::CgkaError;
@@ -109,6 +109,10 @@ where
 /// Why revoking a member failed.
 #[derive(Debug, Error)]
 pub enum RevokeMemberError<E: core::error::Error + 'static> {
+    /// Loading from the store failed.
+    #[error(transparent)]
+    Hydrate(#[from] HydrateError),
+
     /// The identifier was not found.
     #[error(transparent)]
     NotFound(#[from] NotFound),

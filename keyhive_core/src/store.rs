@@ -30,14 +30,21 @@
 //! Persisting is idempotent in every case, so a caller that persists
 //! something twice, or before the keyhive sees it, is correct.
 //!
-//! # Errors
+//! # Loading
 //!
-//! A failing read is not something a keyhive can recover from in the middle of
-//! a call: it would have to answer from a state it cannot know. A keyhive
-//! panics with the store's error instead of threading it through every
-//! method.
+//! A keyhive [opened](crate::keyhive::Keyhive::open) from a store holds none of
+//! its documents. The caller loads what it is about to use with
+//! [`Keyhive::hydrate`][crate::keyhive::Keyhive::hydrate] and
+//! [`Keyhive::hydrate_individuals`][crate::keyhive::Keyhive::hydrate_individuals],
+//! which are fallible. A method that returns a `Result` and needs a document
+//! that is not loaded fails with [`NotFound::NotLoaded`][crate::error::not_found::NotFound];
+//! one that returns a `bool` or an `Option` answers from what is loaded.
+//! [`Keyhive::evict`][crate::keyhive::Keyhive::evict] forgets a document, to load it
+//! again after another process changed it.
 
 pub mod memory;
+
+use thiserror::Error;
 
 use crate::{
     event::static_event::StaticEvent,
@@ -259,3 +266,15 @@ pub struct CgkaOpIndexRow {
 
 #[cfg(test)]
 mod tests;
+
+/// Why loading from a store or from Keyline for it failed.
+#[derive(Debug, Error)]
+pub enum HydrateError {
+    /// The store failed.
+    #[error("the store failed: {0}")]
+    Store(Box<dyn core::error::Error + Send + Sync>),
+
+    /// Keyline failed to answer for what was loaded.
+    #[error("Keyline failed: {0}")]
+    Keyline(Box<dyn core::error::Error + Send + Sync>),
+}

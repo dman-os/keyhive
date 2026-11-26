@@ -34,7 +34,7 @@ use crate::{
         Principal,
     },
     stats::Stats,
-    store::{Identity, KeyhiveStore, Preliminary},
+    store::{HydrateError, Identity, KeyhiveStore, Preliminary},
     transact::{
         fork::ForkAsync,
         merge::{Merge, MergeAsync},
@@ -144,10 +144,23 @@ pub struct KeyhiveState<
     unjoined: Mutex<HashMap<DocumentId, Cgka<KeylineImplicitRemovesProtocol>>>,
 
     /// Serializes loading a document's CGKA operations from the store, so two
-    /// uses of a document that is not loaded yet build one CGKA group, not
-    /// two. Taken before any lock on `documents`, `unjoined` or
-    /// `certificate_sets`, and never while holding one of them.
+    /// loads of a document build one CGKA group, not two. Taken before any
+    /// lock on `documents`, `unjoined` or `certificate_sets`, and never while
+    /// holding one of them.
     hydrating: async_lock::Mutex<()>,
+
+    /// The documents [`Keyhive::hydrate`] has looked for in the store, found
+    /// or not. A document that is neither loaded nor in here is one this
+    /// keyhive cannot yet answer for ([`NotFound::NotLoaded`]).
+    hydrated: Mutex<HashSet<DocumentId>>,
+
+    /// Whether the store holds nothing this keyhive has not loaded: true for
+    /// a keyhive that [generated](Keyhive::generate) its identity over an
+    /// empty store, false for one that was [opened](Keyhive::open).
+    complete: bool,
+
+    /// The documents [`Keyhive::evict`] forgot: not known even when `complete`.
+    evicted: Mutex<HashSet<DocumentId>>,
 
     /// The store this replica reads its persisted state from. It is never
     /// written to here: see [`crate::store`].
@@ -293,6 +306,9 @@ where
             documents: Mutex::new(HashMap::new()),
             unjoined: Mutex::new(HashMap::new()),
             hydrating: async_lock::Mutex::new(()),
+            hydrated: Mutex::new(HashSet::new()),
+            complete: true,
+            evicted: Mutex::new(HashSet::new()),
             store: Arc::new(store),
             unpersisted: Mutex::new(Preliminary::default()),
             certificate_sets: Mutex::new(CertificateSets::new()),
@@ -310,11 +326,11 @@ where
     }
 
     /// Reopen a replica from `store`, loading its identity and its waiting
-    /// events and nothing else: a document's CGKA group is built from its
-    /// operations in `store` the first time the document is used, and an
-    /// individual's prekey operations are read when it is first asked for.
-    /// The certificates are `keyline`'s, and what CGKA operations cite is
-    /// fetched from it as the operations that cite them are loaded.
+    /// events and nothing else. The caller loads a document with
+    /// [`Self::hydrate`] and individuals with [`Self::hydrate_individuals`]
+    /// before it uses them (see [`crate::store`]). The certificates are
+    /// `keyline`'s, and what CGKA operations cite is fetched from it as the
+    /// operations that cite them are loaded.
     ///
     /// `store` must hold what [`Self::generate`]d this identity
     /// ([`Self::identity`]), and what the caller has kept since (see
@@ -364,6 +380,9 @@ where
             documents: Mutex::new(HashMap::new()),
             unjoined: Mutex::new(HashMap::new()),
             hydrating: async_lock::Mutex::new(()),
+            hydrated: Mutex::new(HashSet::new()),
+            complete: false,
+            evicted: Mutex::new(HashSet::new()),
             store: Arc::new(store),
             unpersisted: Mutex::new(Preliminary::default()),
             certificate_sets: Mutex::new(CertificateSets::new()),
@@ -963,6 +982,12 @@ where
                 ImpliedCgkaOpsOutcome::Success
             });
         }
+        let to_add: Vec<_> = readers
+            .iter()
+            .map(|id| IndividualId::from(*id))
+            .filter(|reader| !members.contains(reader))
+            .collect();
+        self.hydrate_missing_individuals(&to_add).await?;
         let mut stale = false;
         if triggers_removes {
             // The remove may cite this replica's own revocation.
@@ -1243,10 +1268,14 @@ where
     /// together with the new certificates, once the lock is released, whether
     /// or not reconciliation finished. A document a failure left behind gets
     /// its operations from the next member to write to it ([`Self::reconcile_before_writing`]).
-    async fn insert_and_reconcile<E: From<KeylineStorageError<K::Error>>>(
+    async fn insert_and_reconcile<E: From<KeylineStorageError<K::Error>> + From<HydrateError>>(
         &self,
         batch: &[VerifiedCertificate<ContentHeads<T>>],
+        subjects: &[Identifier],
     ) -> Result<Vec<Verified<CgkaOperation>>, E> {
+        // The documents the batch can change the readers of are loaded, so
+        // that the CGKA operations it implies are issued now.
+        self.hydrate_affected(subjects).await?;
         let mut fresh = Vec::new();
         let mut ops = Vec::new();
         let result = {
@@ -1270,7 +1299,7 @@ where
     ///
     /// Each document whose readers the batch changed gets the operations
     /// [`Self::issue_implied_cgka_ops`] issues.
-    async fn reconcile_locked<E: From<KeylineStorageError<K::Error>>>(
+    async fn reconcile_locked<E: From<KeylineStorageError<K::Error>> + From<HydrateError>>(
         &self,
         reconciled: &mut Reconciled<'_>,
         batch: &[VerifiedCertificate<ContentHeads<T>>],
@@ -1317,6 +1346,9 @@ where
                     .map(|_| ()),
                 Err(e) => Err(e.into()),
             };
+            if let Err(CgkaSyncError::Hydrate(error)) = issued {
+                return Err(error.into());
+            }
             if let Err(error) = issued {
                 tracing::warn!(%doc_id, %error, "could not issue the CGKA operations the certificates imply");
             }
@@ -1356,29 +1388,21 @@ where
         &self,
         subject: Identifier,
     ) -> Result<BTreeMap<Identifier, ContentHeads<T>>, KeylineStorageError<K::Error>> {
+        let documents: Vec<_> = {
+            self.documents
+                .lock()
+                .await
+                .iter()
+                .map(|(id, state)| (*id, state.dupe()))
+                .collect()
+        };
         let mut retain = BTreeMap::new();
-        for doc_id in self.known_documents().await {
+        for (doc_id, state) in documents {
             let doc = Identifier::from(doc_id);
             if doc != subject && self.positive_power(doc, subject).await?.is_none() {
                 continue;
             }
-            // Only a joined document has heads. A loaded one has them in
-            // memory; for one that is not loaded they are read from the store
-            // without building its CGKA group.
-            let loaded = self.documents.lock().await.get(&doc_id).duped();
-            let heads: ContentHeads<T> = match loaded {
-                Some(state) => state.lock().await.content_heads.iter().cloned().collect(),
-                None => self
-                    .store
-                    .load_content_heads(doc_id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("the store could not read {doc_id}'s content heads: {error}")
-                    })
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-            };
+            let heads: ContentHeads<T> = state.lock().await.content_heads.iter().cloned().collect();
             // No heads known here: say nothing, rather than "keep none".
             if !heads.is_empty() {
                 retain.insert(doc, heads);
@@ -1517,6 +1541,7 @@ where
         initial_content_heads: NonEmpty<T>,
     ) -> Result<DocumentId, GenerateDocError<K::Error>> {
         let doc_id = DocumentId(Identifier::from(&reserved_signer));
+        self.hydrate(doc_id).await?;
         if self.has_document(doc_id).await {
             return Err(GenerateDocError::AlreadyExists(doc_id));
         }
@@ -1603,6 +1628,7 @@ where
         if !readers.contains(&owner) {
             return Err(GenerateDocError::OwnerCannotRead);
         }
+        self.hydrate_missing_individuals(&readers).await?;
         let mut founders = Vec::with_capacity(readers.len());
         for reader in readers {
             let (prekey, key_proof) = if reader == owner {
@@ -1733,11 +1759,8 @@ where
 
     #[instrument(skip_all)]
     /// Add an individual to the table. `false`, and nothing changes, if it is
-    /// already there, or the store already holds its prekey operations.
+    /// already there.
     pub async fn register_individual(&self, individual: IndividualState) -> bool {
-        if self.individual_state(individual.id()).await.is_some() {
-            return false;
-        }
         match self.individuals.lock().await.entry(individual.id()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(entry) => {
@@ -1776,7 +1799,13 @@ where
             delegations.push(delegation);
         }
         let cgka_ops = self
-            .insert_and_reconcile::<AddMemberError<K::Error>>(&batch)
+            .insert_and_reconcile::<AddMemberError<K::Error>>(
+                &batch,
+                &resources
+                    .iter()
+                    .map(|r| Identifier::from(*r))
+                    .collect::<Vec<_>>(),
+            )
             .await?;
         Ok(AddMembersUpdate {
             delegations,
@@ -1803,9 +1832,10 @@ where
         let delegation = self.sign_delegation(to_add, resource, can).await?;
 
         let cgka_ops = self
-            .insert_and_reconcile::<AddMemberError<K::Error>>(&[VerifiedCertificate::Delegation(
-                delegation.dupe(),
-            )])
+            .insert_and_reconcile::<AddMemberError<K::Error>>(
+                &[VerifiedCertificate::Delegation(delegation.dupe())],
+                &[Identifier::from(resource)],
+            )
             .await?;
 
         Ok(AddMemberUpdate {
@@ -1904,6 +1934,8 @@ where
             Vec::new()
         };
 
+        // The watermark reads the heads of the documents the member stands over.
+        self.hydrate_affected(&[subject]).await?;
         let retain = self.content_watermark(subject).await?;
         let mut revocations = Vec::with_capacity(revocable.len());
         for digest in revocable {
@@ -1927,7 +1959,7 @@ where
             )
             .collect();
         let cgka_ops = self
-            .insert_and_reconcile::<RevokeMemberError<K::Error>>(&batch)
+            .insert_and_reconcile::<RevokeMemberError<K::Error>>(&batch, &[subject])
             .await?;
 
         Ok(RevokeMemberUpdate {
@@ -1982,16 +2014,14 @@ where
         Ok(())
     }
 
-    /// Whether `doc` has a key for `content_ref`. Returns `false` if this replica
-    /// has not joined `doc`.
+    /// Whether `doc` has a key for `content_ref` in memory. Returns `false` if this
+    /// replica has not joined `doc`, or has not loaded it ([`Keyhive::hydrate`]). A
+    /// key the store has cached is loaded when a write needs it.
     pub async fn has_key_for(&self, doc: DocumentId, content_ref: &T) -> bool {
-        let Some(state) = self.document_state(doc).await else {
-            return false;
-        };
-        let mut locked = state.lock().await;
-        self.load_content_keys(doc, &mut locked, std::slice::from_ref(content_ref))
-            .await;
-        locked.has_key_for(content_ref)
+        match self.document_state(doc).await {
+            Some(state) => state.lock().await.has_key_for(content_ref),
+            None => false,
+        }
     }
 
     /// Load into `state` the keys of `refs` that it lacks and the store has
@@ -2000,7 +2030,12 @@ where
     /// [`EncryptContentError::NoKeyForPredecessor`]: a keyhive refers only to
     /// content it has written or read, and does not derive a key it was never
     /// given, though for content from an epoch it has access to it could.
-    async fn load_content_keys(&self, doc: DocumentId, state: &mut DocumentState<T>, refs: &[T]) {
+    async fn load_content_keys(
+        &self,
+        doc: DocumentId,
+        state: &mut DocumentState<T>,
+        refs: &[T],
+    ) -> Result<(), HydrateError> {
         for content_ref in refs {
             if state.has_key_for(content_ref) {
                 continue;
@@ -2009,9 +2044,7 @@ where
                 .store
                 .get_cached_content_key(doc, content_ref)
                 .await
-                .unwrap_or_else(|error| {
-                    panic!("the store could not read a content key of {doc}: {error}")
-                });
+                .map_err(|e| HydrateError::Store(Box::new(e)))?;
             if let Some(key) = cached {
                 state.remember_key(AncestorKey::from_trusted_storage(
                     content_ref.clone(),
@@ -2020,6 +2053,7 @@ where
                 ));
             }
         }
+        Ok(())
     }
 
     /// Encrypt `content` into `doc` after `pred_refs`, with the key this document has for
@@ -2062,7 +2096,7 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
-            self.load_content_keys(doc, &mut locked, pred_refs).await;
+            self.load_content_keys(doc, &mut locked, pred_refs).await?;
             let ancestors = locked
                 .predecessor_keys(pred_refs)
                 .map_err(EncryptContentError::NoKeyForPredecessor)?;
@@ -2119,7 +2153,7 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
-            self.load_content_keys(doc, &mut locked, pred_refs).await;
+            self.load_content_keys(doc, &mut locked, pred_refs).await?;
             let ancestors = locked
                 .predecessor_keys(pred_refs)
                 .map_err(EncryptContentError::NoKeyForPredecessor)?;
@@ -2332,8 +2366,23 @@ where
         doc: DocumentId,
         encrypted: &EncryptedContent<P, T>,
     ) -> Result<(Envelope<T, Vec<u8>>, SymmetricKey), DecryptError> {
-        let Some(state) = self.member_document(doc).await? else {
-            return Err(DecryptError::KeyNotFound); // invited, no keys yet
+        let state = match self.member_document(doc).await {
+            Ok(Some(state)) => state,
+            Ok(None) => return Err(DecryptError::KeyNotFound), // invited, no keys yet
+            // Not loaded: a key this replica cached for the content opens it
+            // without the document's CGKA group. It is a key the replica
+            // already had, so this gives no access a loaded document would not.
+            Err(not_loaded @ NotFound::NotLoaded(_)) => {
+                let cached = self
+                    .store
+                    .get_cached_content_key(doc, &encrypted.content_ref)
+                    .await
+                    .map_err(|e| DecryptError::Store(e.to_string()))?
+                    .ok_or(not_loaded)?;
+                let (envelope, _) = Envelope::open(encrypted, &cached, doc.into())?;
+                return Ok((envelope, cached));
+            }
+            Err(other) => return Err(other.into()),
         };
         let mut locked = state.lock().await;
         let key = self.decryption_key(doc, &mut locked, encrypted).await?;
@@ -2847,7 +2896,7 @@ where
     }
 
     /// Every CGKA operation in this replica's CGKA graph for `doc`, joined or
-    /// not. Returns `None` if it holds none.
+    /// not. Returns `None` if it holds none loaded.
     #[instrument(skip_all)]
     pub async fn cgka_ops_for_doc(
         &self,
@@ -2857,7 +2906,6 @@ where
             let ops = cgka_ops_for(state.lock().await.cgka());
             return Some(ops);
         }
-        // `document_state` loaded it, if the store has it.
         self.unjoined.lock().await.get(doc).map(cgka_ops_for)
     }
 
@@ -2933,10 +2981,11 @@ where
 
         // Every principal that is sent anything, and everyone this replica knows.
         let mut agents: BTreeSet<Identifier> = self
-            .known_individuals()
+            .individuals
+            .lock()
             .await
-            .into_iter()
-            .map(Identifier::from)
+            .keys()
+            .map(|id| (*id).into())
             .collect();
         agents.insert(active_id);
         agents.extend(sources.keys().copied());
@@ -2983,12 +3032,24 @@ where
         let mut ops: HashMap<Identifier, Vec<Arc<Verified<CgkaOperation>>>> = HashMap::new();
         let mut index: HashMap<Identifier, HashSet<Identifier>> = HashMap::new();
 
-        let mut held = Vec::new();
-        for doc_id in self.known_documents().await {
-            if let Some(doc_ops) = self.cgka_ops_for_doc(&doc_id).await {
-                held.push((doc_id, doc_ops));
-            }
+        let docs: Vec<(DocumentId, Arc<Mutex<DocumentState<T>>>)> = {
+            let documents = self.documents.lock().await;
+            documents
+                .iter()
+                .map(|(id, doc)| (*id, doc.dupe()))
+                .collect()
+        };
+        let mut held = Vec::with_capacity(docs.len());
+        for (doc_id, doc) in docs {
+            held.push((doc_id, cgka_ops_for(doc.lock().await.cgka())));
         }
+        held.extend(
+            self.unjoined
+                .lock()
+                .await
+                .iter()
+                .map(|(doc_id, cgka)| (*doc_id, cgka_ops_for(cgka))),
+        );
 
         for (doc_id, doc_ops) in held {
             if doc_ops.is_empty() {
@@ -3146,29 +3207,37 @@ where
             .then(|| Document::new(self.clone(), id))
     }
 
+    /// An individual this replica has loaded. Memory only: see
+    /// [`Self::hydrate_individuals`].
     pub(crate) async fn individual_state(
         &self,
         id: IndividualId,
     ) -> Option<Arc<Mutex<IndividualState>>> {
-        if let Some(loaded) = self.individuals.lock().await.get(&id) {
-            return Some(loaded.dupe());
-        }
-        let ops = self
-            .store
-            .load_prekey_ops(id)
-            .await
-            .unwrap_or_else(|error| panic!("the store could not read {id}'s prekeys: {error}"));
-        let state = individual_from_ops(ops).filter(|state| state.id() == id)?;
-        // Another use may have loaded or received it meanwhile; its state is
-        // the later one.
-        Some(
-            self.individuals
-                .lock()
+        self.individuals.lock().await.get(&id).duped()
+    }
+
+    /// Load the prekey operations the store holds for `ids` into this
+    /// replica's individuals, merging them into any it has received since.
+    /// Call it for the individuals an operation is about to use: whose prekeys
+    /// a member is added with, for example.
+    pub async fn hydrate_individuals(&self, ids: &[IndividualId]) -> Result<(), HydrateError> {
+        for id in ids {
+            let ops = self
+                .store
+                .load_prekey_ops(*id)
                 .await
-                .entry(id)
-                .or_insert_with(|| Arc::new(Mutex::new(state)))
-                .dupe(),
-        )
+                .map_err(|e| HydrateError::Store(Box::new(e)))?;
+            let Some(state) = individual_from_ops(ops).filter(|state| state.id() == *id) else {
+                continue;
+            };
+            match self.individuals.lock().await.entry(*id) {
+                Entry::Occupied(held) => held.get().lock().await.merge(state),
+                Entry::Vacant(vacant) => {
+                    vacant.insert(Arc::new(Mutex::new(state)));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether this replica has a CGKA group for `doc_id` in memory, joined or
@@ -3178,116 +3247,144 @@ where
             || self.unjoined.lock().await.contains_key(&doc_id)
     }
 
-    /// Make `doc_id`'s CGKA group, if the store holds its operations and this
-    /// replica has not loaded it yet, resident: a document if this replica's
-    /// invitation (or creation) has merged, unjoined otherwise. Its content
-    /// heads come with it. Every use of a document goes through here first,
-    /// so a document nobody uses is never read.
+    /// Whether this keyhive can answer for `doc_id`: it holds it, or has looked
+    /// for it in the store, or holds everything the store does.
+    async fn is_known(&self, doc_id: DocumentId) -> bool {
+        (self.complete && !self.evicted.lock().await.contains(&doc_id))
+            || self.hydrated.lock().await.contains(&doc_id)
+            || self.is_loaded(doc_id).await
+    }
+
+    /// Load `doc_id` from the store: build its CGKA group from the operations
+    /// the store holds, a document if this replica's invitation (or creation)
+    /// has merged and an unjoined group otherwise, with the content heads the
+    /// store holds. Does nothing if it is loaded already; to load it again,
+    /// [`Self::evict`] it first. A document the store has nothing for stays
+    /// absent, and is no longer [`NotFound::NotLoaded`].
     ///
     /// The operations are authorized again as they merge, as an archive's
     /// are ([`Self::cgka_from_ops`]); one whose certificates have not arrived
     /// waits in the pending events.
-    ///
-    /// Panics if the store or Keyline cannot answer: there is no state this
-    /// call could fall back to.
-    async fn hydrate(&self, doc_id: DocumentId) {
-        if self.is_loaded(doc_id).await {
-            return;
-        }
+    pub async fn hydrate(&self, doc_id: DocumentId) -> Result<(), HydrateError> {
         let _loading = self.hydrating.lock().await;
         if self.is_loaded(doc_id).await {
-            return;
+            return Ok(());
         }
         let ops = self
             .store
             .load_cgka_ops(doc_id)
             .await
-            .unwrap_or_else(|error| {
-                panic!("the store could not read {doc_id}'s CGKA operations: {error}")
-            });
-        if ops.is_empty() {
-            return;
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        if !ops.is_empty() {
+            let heads = self
+                .store
+                .load_content_heads(doc_id)
+                .await
+                .map_err(|e| HydrateError::Store(Box::new(e)))?
+                .unwrap_or_default();
+            self.install_cgka_ops(doc_id, ops, true, heads.into_iter().collect())
+                .await
+                .map_err(|e| HydrateError::Keyline(Box::new(e)))?;
         }
-        let heads = self
-            .store
-            .load_content_heads(doc_id)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("the store could not read {doc_id}'s content heads: {error}")
-            })
-            .unwrap_or_default();
-        self.install_cgka_ops(doc_id, ops, true, heads.into_iter().collect())
-            .await
-            .unwrap_or_else(|error| {
-                panic!("Keyline could not answer for {doc_id}'s CGKA operations: {error}")
-            });
+        self.hydrated.lock().await.insert(doc_id);
+        Ok(())
     }
 
-    /// [`Self::hydrate`] for everything the store holds: every document, and
-    /// every individual. For a full export or a census, which have to look at
-    /// everything.
-    async fn hydrate_all(&self) {
+    /// Forget `doc_id`'s CGKA group, content heads and content keys in memory,
+    /// so that [`Self::hydrate`] reads them again: after another process
+    /// changed what the store holds. Whatever was not persisted is lost, and
+    /// handles to the document from before keep the state they had.
+    pub async fn evict(&self, doc_id: DocumentId) {
+        let _loading = self.hydrating.lock().await;
+        self.documents.lock().await.remove(&doc_id);
+        self.unjoined.lock().await.remove(&doc_id);
+        self.hydrated.lock().await.remove(&doc_id);
+        self.evicted.lock().await.insert(doc_id);
+    }
+
+    /// [`Self::hydrate`] every document the store holds, and every individual
+    /// it holds prekeys for: before an export, or a census.
+    pub async fn hydrate_all(&self) -> Result<(), HydrateError> {
         let docs = self
             .store
             .list_documents()
             .await
-            .unwrap_or_else(|error| panic!("the store could not list documents: {error}"));
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
         for doc in docs {
-            self.hydrate(doc).await;
+            self.hydrate(doc).await?;
         }
-        for id in self.known_individuals().await {
-            self.individual_state(id).await;
+        let individuals = self
+            .store
+            .list_individuals()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        self.hydrate_individuals(&individuals).await
+    }
+
+    /// [`Self::hydrate_individuals`] those of `ids` that are not loaded.
+    async fn hydrate_missing_individuals(&self, ids: &[IndividualId]) -> Result<(), HydrateError> {
+        let missing: Vec<_> = {
+            let loaded = self.individuals.lock().await;
+            ids.iter()
+                .filter(|id| !loaded.contains_key(id))
+                .copied()
+                .collect()
+        };
+        self.hydrate_individuals(&missing).await
+    }
+
+    /// Load every document in the store that one of `subjects` is, or stands
+    /// over, which is every document a change to what they grant can change
+    /// the readers of.
+    async fn hydrate_affected(&self, subjects: &[Identifier]) -> Result<(), HydrateError> {
+        let held = self
+            .store
+            .list_documents()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        for doc_id in held {
+            let doc = Identifier::from(doc_id);
+            let mut affected = false;
+            for subject in subjects {
+                affected = doc == *subject
+                    || self
+                        .positive_power(doc, *subject)
+                        .await
+                        .map_err(|e| HydrateError::Keyline(Box::new(e)))?
+                        .is_some();
+                if affected {
+                    break;
+                }
+            }
+            if affected {
+                self.hydrate(doc_id).await?;
+            }
         }
+        Ok(())
     }
 
-    /// Every individual this replica has loaded or the store holds.
-    async fn known_individuals(&self) -> BTreeSet<IndividualId> {
-        let mut known: BTreeSet<_> = self.individuals.lock().await.keys().copied().collect();
-        known.extend(
-            self.store
-                .list_individuals()
-                .await
-                .unwrap_or_else(|error| panic!("the store could not list individuals: {error}")),
-        );
-        known
-    }
-
-    /// Every document this replica has loaded or the store holds a CGKA group
-    /// for.
-    async fn known_documents(&self) -> BTreeSet<DocumentId> {
-        let mut known: BTreeSet<_> = self.documents.lock().await.keys().copied().collect();
-        known.extend(self.unjoined.lock().await.keys().copied());
-        known.extend(
-            self.store
-                .list_documents()
-                .await
-                .unwrap_or_else(|error| panic!("the store could not list documents: {error}")),
-        );
-        known
-    }
-
-    /// This replica's state for a document it is a member of.
+    /// This replica's state for a document it is a member of. Memory only:
+    /// see [`Self::hydrate`].
     #[allow(clippy::type_complexity)]
     pub(crate) async fn document_state(
         &self,
         id: DocumentId,
     ) -> Option<Arc<Mutex<DocumentState<T>>>> {
-        self.hydrate(id).await;
         self.documents.lock().await.get(&id).duped()
     }
 
     /// Whether this replica holds the document: it is a member, and its
     /// creation or invitation has merged into its CGKA graph. To a replica that does
     /// not, such as a relay, a document is a Keyline subject like a group.
+    ///
+    /// Answers from what is loaded: [`Self::hydrate`] the document first.
     #[instrument(skip_all)]
     pub async fn has_document(&self, id: DocumentId) -> bool {
-        self.hydrate(id).await;
         self.documents.lock().await.contains_key(&id)
     }
 
     /// Whether this replica holds `id`'s CGKA graph, joined or not.
     async fn contains_cgka_graph(&self, id: DocumentId) -> bool {
-        self.hydrate(id).await;
         self.is_loaded(id).await
     }
 
@@ -3305,7 +3402,8 @@ where
         Ok(self.subjects().await?.contains(&subject))
     }
 
-    /// Whether an individual with this id is known.
+    /// Whether an individual with this id is known. Answers from what is
+    /// loaded: [`Self::hydrate_individuals`] it first.
     #[instrument(skip_all)]
     pub async fn has_individual(&self, id: IndividualId) -> bool {
         self.individual_state(id).await.is_some()
@@ -3553,7 +3651,6 @@ where
             let mut sets = self.certificate_sets.lock().await;
             return sets.predecessor_set(locked.cgka(), heads);
         }
-        // `document_state` loaded it, if the store has it.
         let unjoined = self.unjoined.lock().await;
         let cgka = unjoined.get(&doc_id)?;
         let mut sets = self.certificate_sets.lock().await;
@@ -3697,6 +3794,11 @@ where
                 .await?;
         }
 
+        // Merging into a graph built without what the store holds would fork it.
+        if !self.is_known(doc_id).await {
+            return Err(ReceiveCgkaOpError::NotLoaded(Box::new(doc_id)));
+        }
+
         // Not a member. If this replica has ever stood over the document, its
         // operations merge into an unjoined CGKA in causal order. A reader's
         // becomes its document once its invitation merges; starting on the
@@ -3782,6 +3884,9 @@ where
             // Held throughout, so no operation is received into the unjoined
             // CGKA graph while it becomes a document.
             let _reconciled = self.certificates.reconciled.lock().await;
+            if !self.is_known(doc_id).await {
+                return Err(NotFound::NotLoaded(doc_id).into());
+            }
             let held = self.document_state(doc_id).await;
             let state = match &held {
                 Some(state) => state.dupe(),
@@ -3870,8 +3975,6 @@ where
     /// [`Archive::encode_zeroizing`].
     #[instrument(skip_all)]
     pub async fn into_archive(&self) -> Result<Archive<T>, KeylineStorageError<K::Error>> {
-        // An export holds everything, so everything is loaded first.
-        self.hydrate_all().await;
         let mut archive = self.archive_state().await;
         archive.certificates = self
             .keyline()
@@ -3960,6 +4063,7 @@ where
             listener,
             certificates,
             Arc::new(store),
+            true,
             csprng,
             true,
         )
@@ -3978,6 +4082,7 @@ where
         listener: L,
         shared: Arc<Certificates<K>>,
         store: Arc<H>,
+        complete: bool,
         csprng: Arc<Mutex<R>>,
         authorize: bool,
     ) -> Result<Self, TryFromArchiveError<K::Error>> {
@@ -4023,6 +4128,9 @@ where
             documents: Mutex::new(HashMap::new()),
             unjoined: Mutex::new(HashMap::new()),
             hydrating: async_lock::Mutex::new(()),
+            hydrated: Mutex::new(HashSet::new()),
+            complete,
+            evicted: Mutex::new(HashSet::new()),
             store,
             unpersisted: Mutex::new(Preliminary::default()),
             certificate_sets: Mutex::new(CertificateSets::new()),
@@ -4201,8 +4309,6 @@ where
             .chain(std::iter::once(archive.active.individual));
         for indie in archived {
             let id = indie.id();
-            // Load ours first, so the merge is into everything the store holds.
-            self.individual_state(id).await;
             let mut locked_indies = self.individuals.lock().await;
             if let Some(our_indie) = locked_indies.get_mut(&id) {
                 our_indie.merge_async(indie).await;
@@ -4331,10 +4437,7 @@ where
         Ok(())
     }
 
-    /// Counts of everything this replica holds. A census looks at everything,
-    /// so it loads every document and individual the store holds.
     pub async fn stats(&self) -> Stats {
-        self.hydrate_all().await;
         let active_prekey_count = self.active.individual.lock().await.prekey_ops().len() as u64;
 
         // Count prekeys_expanded and prekey_rotations across all individuals
@@ -4481,14 +4584,25 @@ where
         &self,
         id: DocumentId,
     ) -> Result<Arc<Mutex<DocumentState<T>>>, NotFound> {
-        self.document_state(id)
-            .await
-            .ok_or_else(|| NotFound::new(id))
+        match self.document_state(id).await {
+            Some(state) => Ok(state),
+            None => Err(self.absent(id).await),
+        }
+    }
+
+    /// Why this replica has no document for `id`: it has never heard of it, or
+    /// it has not looked in its store.
+    async fn absent(&self, id: DocumentId) -> NotFound {
+        if self.is_known(id).await {
+            NotFound::new(id)
+        } else {
+            NotFound::NotLoaded(id)
+        }
     }
 
     /// This replica's document for `id`, as a member of its CGKA group.
     /// Returns `None` if it holds the CGKA graph unjoined, so has no keys, and
-    /// a `NotFound` error if it has nothing for it.
+    /// a `NotFound` error if it has nothing for it or has not loaded it.
     async fn member_document(
         &self,
         id: DocumentId,
@@ -4497,7 +4611,7 @@ where
             Some(doc) => Ok(Some(doc)),
             // Held, but not joined: no keys.
             None if self.unjoined.lock().await.contains_key(&id) => Ok(None),
-            None => Err(NotFound::new(id)),
+            None => Err(self.absent(id).await),
         }
     }
 }
@@ -4581,18 +4695,22 @@ where
     /// cannot fail once they have.
     async fn fork_async(&self) -> Self::AsyncForked {
         let signer = { self.active.signer.clone() };
-        Keyhive::from_archive_sharing(
+        let fork = Keyhive::from_archive_sharing(
             &self.archive_state().await,
             signer,
             self.ciphertext_store.clone(),
             Log::new(),
             self.certificates.dupe(),
             self.store.dupe(),
+            self.complete,
             self.csprng.clone(),
             false,
         )
         .await
-        .expect("an archive with no certificates verifies and inserts nothing")
+        .expect("an archive with no certificates verifies and inserts nothing");
+        *fork.hydrated.lock().await = self.hydrated.lock().await.clone();
+        *fork.evicted.lock().await = self.evicted.lock().await.clone();
+        fork
     }
 }
 
@@ -4661,6 +4779,16 @@ where
                 // not apply yet waits like any other received one.
                 Event::CgkaOperation(op) => {
                     let event = VerifiedEvent::CgkaOperation(op.dupe());
+                    // The fork may have founded a document this keyhive has not
+                    // looked for in its store.
+                    let doc_id = DocumentId::from(op.payload().doc_id);
+                    if !self.is_known(doc_id).await {
+                        if let Err(error) = self.hydrate(doc_id).await {
+                            tracing::warn!(%error, "could not load a fork's document; its event waits");
+                            self.pending_events.lock().await.push(Arc::new(event));
+                            continue;
+                        }
+                    }
                     if let Err(error) = self.receive_verified_event(&event).await {
                         if error.is_final() {
                             tracing::warn!(%error, "dropping a fork's event that can never apply");
@@ -4780,6 +4908,7 @@ impl<E: core::error::Error + 'static> ReceiveStaticEventError<E> {
                 ReceiveCgkaOpError::CgkaError(cgka) => never_merges(cgka),
                 ReceiveCgkaOpError::UnknownDocument(_)
                 | ReceiveCgkaOpError::UnknownInvitePrekey(_)
+                | ReceiveCgkaOpError::NotLoaded(_)
                 | ReceiveCgkaOpError::PendingCgkaAuthorization(_)
                 | ReceiveCgkaOpError::KeylineStorage(_) => false,
             },
@@ -5050,6 +5179,11 @@ pub enum ReceiveCgkaOpError<E: core::error::Error + 'static> {
     #[error("Unknown invite prekey for received CGKA add op: {0}")]
     UnknownInvitePrekey(ShareKey),
 
+    /// The document has not been loaded from the store: [`Keyhive::hydrate`] it
+    /// and receive the operation again.
+    #[error("CGKA op for {0} arrived before the document was loaded")]
+    NotLoaded(Box<DocumentId>),
+
     /// No certificate or CGKA op received in the future can authorize this op.
     #[error("CGKA op for {0} is not authorized by its certificate sets")]
     UnauthorizedCgkaOp(Box<DocumentId>),
@@ -5071,6 +5205,7 @@ impl<E: core::error::Error + 'static> ReceiveCgkaOpError<E> {
             // of this identity holds, may still arrive.
             Self::UnknownDocument(_) => true,
             Self::UnknownInvitePrekey(_) => true,
+            Self::NotLoaded(_) => true,
             Self::UnauthorizedCgkaOp(_) => false,
             Self::PendingCgkaAuthorization(_) => true,
             Self::KeylineStorage(_) => false,
@@ -5158,6 +5293,14 @@ pub enum CgkaSyncError<E: core::error::Error + 'static> {
     /// The CGKA refused an operation or signing one failed.
     #[error(transparent)]
     Cgka(#[from] CgkaError),
+
+    /// The document is not loaded.
+    #[error(transparent)]
+    NotLoaded(#[from] NotFound),
+
+    /// Loading prekeys the operation needs failed.
+    #[error(transparent)]
+    Hydrate(#[from] HydrateError),
 }
 
 /// A CGKA rebuilt from archived operations by [`Keyhive::cgka_from_ops`].
@@ -5238,6 +5381,10 @@ impl<T: ContentRef> PreparedContent<T> {
 pub enum EncryptContentError<T: ContentRef> {
     #[error(transparent)]
     NotFound(#[from] NotFound),
+
+    /// Reading a cached content key from the store failed.
+    #[error(transparent)]
+    Hydrate(#[from] HydrateError),
 
     #[error(transparent)]
     EncryptError(#[from] EncryptError),

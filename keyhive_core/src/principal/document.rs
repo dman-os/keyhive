@@ -11,7 +11,7 @@ use crate::{
     keyhive::Keyhive,
     listener::membership::MembershipListener,
     principal::{group::RevokeMemberError, membered::id::MemberedId},
-    store::{KeyhiveStore, Preliminary},
+    store::{HydrateError, KeyhiveStore, Preliminary},
     update::{AddMemberUpdate, RevokeMemberUpdate},
 };
 use beekem::{
@@ -555,6 +555,10 @@ where
 
 #[derive(Debug, Error)]
 pub enum AddMemberError<E: core::error::Error + 'static> {
+    /// Loading from the store failed.
+    #[error(transparent)]
+    Hydrate(#[from] HydrateError),
+
     /// The identifier was not found.
     #[error(transparent)]
     NotFound(#[from] NotFound),
@@ -647,6 +651,10 @@ pub enum EncryptError {
 
 #[derive(Debug, Error)]
 pub enum GenerateDocError<E: core::error::Error + 'static> {
+    /// Loading from the store failed.
+    #[error(transparent)]
+    Hydrate(#[from] HydrateError),
+
     #[error(transparent)]
     NotFound(#[from] NotFound),
 
@@ -737,6 +745,9 @@ pub enum DecryptError {
 
     #[error("Key not found")]
     KeyNotFound,
+
+    #[error("Store: {0}")]
+    Store(String),
 
     #[error("Keyline storage: {0}")]
     KeylineStorage(String),

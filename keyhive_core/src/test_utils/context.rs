@@ -117,7 +117,10 @@ pub enum TestError {
 
 impl From<NotFound> for TestError {
     fn from(e: NotFound) -> Self {
-        TestError::NotSynced(e.0)
+        match e {
+            NotFound::Unknown(id) => TestError::NotSynced(id),
+            not_loaded @ NotFound::NotLoaded(_) => TestError::Other(not_loaded.to_string()),
+        }
     }
 }
 

@@ -4,19 +4,21 @@
 use super::{memory::MemoryKeyhiveStore, KeyhiveStore};
 use crate::{
     content::heads::ContentHeads,
+    error::not_found::NotFound,
     event::static_event::StaticEvent,
     keyhive::{Keyhive, PreparedContent},
     listener::{cgka::CgkaListener, membership::MembershipListener, prekey::PrekeyListener},
     principal::{
         active::LocalPrekeySecret,
-        document::id::DocumentId,
+        document::{id::DocumentId, DecryptError},
         individual::{
             id::IndividualId,
             op::{add_key::AddKeyOp, rotate_key::RotateKeyOp, KeyOp},
         },
     },
+    test_utils::has_remove_citing_its_revocation,
 };
-use beekem::operation::CgkaOperation;
+use beekem::operation::{CgkaChange, CgkaOperation};
 use future_form::{FutureForm, Sendable};
 use futures::lock::Mutex;
 use keyhive_content::{encrypted::EncryptedContent, store::memory::MemoryCiphertextStore};
@@ -152,9 +154,17 @@ impl Node {
         }
     }
 
-    /// This replica as it comes back after a restart: its store, and the
-    /// certificates its Keyline store holds.
+    /// This replica as it comes back after a restart, with everything its
+    /// store holds loaded.
     async fn restarted(&self) -> TestResult<Hive> {
+        let hive = self.reopened().await?;
+        hive.hydrate_all().await?;
+        Ok(hive)
+    }
+
+    /// This replica as it comes back after a restart, with nothing loaded: its
+    /// store, and the certificates its Keyline store holds.
+    async fn reopened(&self) -> TestResult<Hive> {
         let keyline = MemoryKeyline::new();
         let certs = Keyline::<Sendable>::certificates(self.hive.keyline())
             .await?
@@ -495,10 +505,11 @@ async fn removal_and_prekey_rotation_survive_a_restart() -> TestResult {
     Ok(())
 }
 
-/// Opening a keyhive reads no document: a document's CGKA operations are read
-/// the first time it is used, and the others' never are.
+/// Opening a keyhive reads no document. A document is read when the caller
+/// hydrates it, and until then a method that returns a `Result` says it is not
+/// loaded, and one that returns a `bool` answers from what is loaded.
 #[tokio::test]
-async fn opening_reads_no_document_until_it_is_used() -> TestResult {
+async fn opening_reads_no_document_until_it_is_hydrated() -> TestResult {
     let alice = Node::new().await;
     let mut docs = Vec::new();
     for n in 0..3u8 {
@@ -513,22 +524,116 @@ async fn opening_reads_no_document_until_it_is_used() -> TestResult {
         3
     );
 
-    let reopened = alice.restarted().await?;
+    let reopened = alice.reopened().await?;
     assert!(
         alice.store.cgka_reads().is_empty(),
         "opening read a document"
     );
-    let baseline = alice.store.cgka_reads().len();
-    assert!(reopened.has_document(docs[1]).await);
-    let reads = alice.store.cgka_reads();
+    assert!(!reopened.has_document(docs[1]).await);
     assert_eq!(
-        &reads[baseline..],
-        &[docs[1]],
-        "only the used document is read"
+        reopened.set_content_heads(docs[1], [[9; 32]]).await,
+        Err(NotFound::NotLoaded(docs[1]))
     );
-    // Used again, it is not read again.
+    assert!(alice.store.cgka_reads().is_empty());
+
+    reopened.hydrate(docs[1]).await?;
+    assert_eq!(
+        alice.store.cgka_reads(),
+        vec![docs[1]],
+        "only that document is read"
+    );
     assert!(reopened.has_document(docs[1]).await);
-    assert_eq!(alice.store.cgka_reads().len(), baseline + 1);
+    reopened.set_content_heads(docs[1], [[9; 32]]).await?;
+    // Hydrating it again reads nothing, and the others are still not loaded.
+    reopened.hydrate(docs[1]).await?;
+    assert_eq!(alice.store.cgka_reads().len(), 1);
+    assert!(!reopened.has_document(docs[0]).await);
+    Ok(())
+}
+
+/// A key the store caches opens its content without loading the document, and
+/// content it has no key for says the document is not loaded.
+#[tokio::test]
+async fn a_cached_key_opens_content_without_loading_the_document() -> TestResult {
+    let s = scenario().await?;
+    let unread = write(&s.alice.hive, &s.alice.store, s.doc, b"unread", &[]).await?;
+    s.bob.receive_from(&s.alice).await?;
+
+    let bob2 = s.bob.reopened().await?;
+    let (envelope, _) = bob2.try_decrypt_content_keyed(s.doc, &s.first).await?;
+    assert_eq!(envelope.plaintext, b"first");
+    assert!(matches!(
+        bob2.try_decrypt_content(s.doc, &unread).await,
+        Err(DecryptError::NotFound(NotFound::NotLoaded(doc))) if doc == s.doc
+    ));
+    assert!(
+        s.bob.store.cgka_reads().is_empty(),
+        "a read loaded the document"
+    );
+
+    // Once loaded, the key comes from the CGKA group as before.
+    bob2.hydrate(s.doc).await?;
+    assert_eq!(
+        bob2.try_decrypt_content(s.doc, &unread).await?.plaintext,
+        b"unread"
+    );
+    Ok(())
+}
+
+/// A document evicted and hydrated again is the document that was never evicted.
+#[tokio::test]
+async fn an_evicted_document_hydrates_to_what_it_was() -> TestResult {
+    let s = scenario().await?;
+    let before = answers(&s.alice.hive, s.doc, &s.first, &s.reply).await?;
+
+    s.alice.hive.evict(s.doc).await;
+    assert!(!s.alice.hive.has_document(s.doc).await);
+    assert_eq!(
+        s.alice.hive.set_content_heads(s.doc, [[9; 32]]).await,
+        Err(NotFound::NotLoaded(s.doc))
+    );
+    s.alice.hive.hydrate(s.doc).await?;
+    assert_eq!(
+        before,
+        answers(&s.alice.hive, s.doc, &s.first, &s.reply).await?
+    );
+    Ok(())
+}
+
+/// A membership change on a document that is not loaded loads it and issues the
+/// CGKA operations it implies at once.
+#[tokio::test]
+async fn adding_and_removing_a_member_on_an_unloaded_document_issues_the_operations() -> TestResult
+{
+    let s = scenario().await?;
+    let carol = Node::new().await;
+    s.alice.learn_individual(&carol).await;
+
+    let alice2 = s.alice.reopened().await?;
+    alice2.hydrate_individuals(&[carol.hive.id()]).await?;
+    assert!(!alice2.has_document(s.doc).await);
+    let added = alice2
+        .add_member(carol.hive.id(), s.doc, Power::Read)
+        .await?;
+    assert!(
+        added
+            .cgka_ops
+            .iter()
+            .any(|op| matches!(op.payload().change, CgkaChange::Add { .. })),
+        "no CGKA add was issued"
+    );
+    assert!(
+        alice2.has_document(s.doc).await,
+        "the affected document was not loaded"
+    );
+
+    let alice3 = s.alice.reopened().await?;
+    assert!(!alice3.has_document(s.doc).await);
+    let removed = alice3.revoke_member(s.bob.hive.id(), true, s.doc).await?;
+    assert!(
+        has_remove_citing_its_revocation(&removed),
+        "no CGKA remove was issued"
+    );
     Ok(())
 }
 
