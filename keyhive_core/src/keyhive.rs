@@ -2639,6 +2639,24 @@ where
         &self,
         who: Identifier,
     ) -> Result<BTreeMap<MemberedId, Power>, KeylineStorageError<K::Error>> {
+        let mut standing = BTreeMap::new();
+        for (subject, can) in self.standing_over_subjects(who).await? {
+            let kind = if self.contains_cgka_graph(DocumentId(subject)).await {
+                MemberedId::DocumentId(DocumentId(subject))
+            } else {
+                MemberedId::GroupId(GroupId(subject))
+            };
+            standing.insert(kind, can);
+        }
+        Ok(standing)
+    }
+
+    /// `who`'s power over every subject in Keyline other than itself, without
+    /// saying what kind of subject each is.
+    async fn standing_over_subjects(
+        &self,
+        who: Identifier,
+    ) -> Result<BTreeMap<Identifier, Power>, KeylineStorageError<K::Error>> {
         let audience = who;
         let subjects = self
             .keyline()
@@ -2657,13 +2675,7 @@ where
             else {
                 continue;
             };
-            let id = subject;
-            let kind = if self.contains_cgka_graph(DocumentId(id)).await {
-                MemberedId::DocumentId(DocumentId(id))
-            } else {
-                MemberedId::GroupId(GroupId(id))
-            };
-            standing.insert(kind, can);
+            standing.insert(subject, can);
         }
         Ok(standing)
     }
@@ -2678,12 +2690,94 @@ where
             .collect()
     }
 
+    /// The documents that waiting events are for, which a caller [hydrates](Self::hydrate)
+    /// before it ingests again: a CGKA operation for a document that is not
+    /// loaded waits, as if its predecessors were missing, until it is.
+    pub async fn pending_documents(&self) -> BTreeSet<DocumentId> {
+        self.pending_events
+            .lock()
+            .await
+            .iter()
+            .filter_map(|event| match event.as_ref() {
+                VerifiedEvent::CgkaOperation(op) => Some(DocumentId::from(op.payload().doc_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many operations this replica holds: certificates, prekey operations
+    /// and CGKA operations. It only ever grows, so a caller that compares two
+    /// counts learns whether anything was added in between, which is all it is
+    /// for.
+    ///
+    /// A document or an individual that is loaded counts what is loaded, and
+    /// one that is not counts the rows its store holds, so the count is the
+    /// same before and after a document is [hydrated](Self::hydrate) and reads
+    /// no document. That holds while a loaded entity holds everything the store
+    /// does, as it does when it was hydrated before an operation for it was
+    /// ingested; an operation ingested for an individual that is not loaded
+    /// leaves one that holds only that operation.
+    pub async fn total_ops(&self) -> Result<u64, HydrateError> {
+        let mut total = 0;
+        let mut loaded_individuals = BTreeSet::new();
+        for (id, individual) in self.individuals.lock().await.iter() {
+            total += individual.lock().await.prekey_ops().len() as u64;
+            loaded_individuals.insert(*id);
+        }
+        let mut loaded_documents = BTreeSet::new();
+        let held: Vec<_> = {
+            self.documents
+                .lock()
+                .await
+                .iter()
+                .map(|(id, doc)| (*id, doc.dupe()))
+                .collect()
+        };
+        for (id, doc) in held {
+            total += doc.lock().await.cgka().ops_count() as u64;
+            loaded_documents.insert(id);
+        }
+        for (id, cgka) in self.unjoined.lock().await.iter() {
+            total += cgka.ops_count() as u64;
+            loaded_documents.insert(*id);
+        }
+        total += self
+            .keyline()
+            .certificates()
+            .await
+            .map_err(KeylineStorageError::new)?
+            .value
+            .len() as u64;
+
+        let stored_ops = self
+            .store
+            .count_cgka_ops()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        total += stored_ops
+            .into_iter()
+            .filter(|(doc, _)| !loaded_documents.contains(doc))
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let stored_prekeys = self
+            .store
+            .count_prekey_ops()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?;
+        total += stored_prekeys
+            .into_iter()
+            .filter(|(who, _)| !loaded_individuals.contains(who))
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        Ok(total)
+    }
+
     #[allow(clippy::type_complexity)]
     #[instrument(skip_all)]
     pub async fn events_for_agent(
         &self,
         who: impl Into<Identifier>,
-    ) -> Result<HashMap<Digest<Event<T>>, Event<T>>, KeylineStorageError<K::Error>> {
+    ) -> Result<HashMap<Digest<Event<T>>, Event<T>>, HydrateError> {
         let (certs, cgka_ops, prekeys) = self.ops_for_agent(who.into()).await?;
         let mut ops = HashMap::new();
 
@@ -2717,7 +2811,7 @@ where
             Vec<Arc<Verified<CgkaOperation>>>,
             KeyOps,
         ),
-        KeylineStorageError<K::Error>,
+        HydrateError,
     > {
         let certs = self.certificates_for_agent(who).await?;
         let cgka_ops = self.cgka_ops_reachable_by_agent(who).await?;
@@ -2735,10 +2829,10 @@ where
         who: Identifier,
         certs: &[Certificate<ContentHeads<T>>],
         cgka_ops: &[Arc<Verified<CgkaOperation>>],
-    ) -> Result<KeyOps, KeylineStorageError<K::Error>> {
+    ) -> Result<KeyOps, HydrateError> {
         let mut referenced = BTreeSet::from([who]);
         for cert in certs {
-            referenced.extend(referenced_by(cert)?);
+            referenced.extend(referenced_by::<_, K::Error>(cert)?);
         }
         for op in cgka_ops {
             referenced.extend(referenced_by_cgka_op(op));
@@ -2746,8 +2840,8 @@ where
 
         let mut map: HashMap<Identifier, CaMap<KeyOp>> = HashMap::new();
         for id in referenced {
-            if let Some(state) = self.individual_state(IndividualId(id)).await {
-                map.insert(id, state.lock().await.prekey_ops().clone());
+            if let Some(ops) = self.held_prekey_ops(id).await? {
+                map.insert(id, ops);
             }
         }
         Ok(map.into())
@@ -2865,8 +2959,7 @@ where
     pub async fn static_events_for_agent(
         &self,
         who: impl Into<Identifier>,
-    ) -> Result<HashMap<Digest<StaticEvent<T>>, StaticEvent<T>>, KeylineStorageError<K::Error>>
-    {
+    ) -> Result<HashMap<Digest<StaticEvent<T>>, StaticEvent<T>>, HydrateError> {
         Ok(self
             .events_for_agent(who.into())
             .await?
@@ -2883,16 +2976,67 @@ where
     pub async fn cgka_ops_reachable_by_agent(
         &self,
         who: impl Into<Identifier>,
-    ) -> Result<Vec<Arc<Verified<CgkaOperation>>>, KeylineStorageError<K::Error>> {
-        let standing = self.standing_of(who.into()).await?;
+    ) -> Result<Vec<Arc<Verified<CgkaOperation>>>, HydrateError> {
+        let standing = self.standing_over_subjects(who.into()).await?;
+        let held = self.held_documents().await?;
         let mut ops = Vec::new();
-        for id in standing.into_keys() {
-            let MemberedId::DocumentId(doc_id) = id else {
-                continue;
-            };
-            ops.extend(self.cgka_ops_for_doc(&doc_id).await.into_iter().flatten());
+        for subject in standing.into_keys() {
+            let doc_id = DocumentId(subject);
+            if held.contains(&doc_id) {
+                ops.extend(self.held_cgka_ops(doc_id).await?);
+            }
         }
         Ok(ops)
+    }
+
+    /// Every document whose CGKA graph this replica holds, joined or not: the
+    /// ones it has loaded and the ones its store holds. Reads the store's list,
+    /// not any document.
+    async fn held_documents(&self) -> Result<BTreeSet<DocumentId>, HydrateError> {
+        let mut held: BTreeSet<DocumentId> = self
+            .store
+            .list_documents()
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?
+            .into_iter()
+            .collect();
+        held.extend(self.documents.lock().await.keys().copied());
+        held.extend(self.unjoined.lock().await.keys().copied());
+        Ok(held)
+    }
+
+    /// The CGKA operations of a held document: the loaded graph's if it is
+    /// loaded (which holds the store's), and otherwise the store's rows, read
+    /// without building a graph from them.
+    async fn held_cgka_ops(
+        &self,
+        doc: DocumentId,
+    ) -> Result<Vec<Arc<Verified<CgkaOperation>>>, HydrateError> {
+        if let Some(ops) = self.cgka_ops_for_doc(&doc).await {
+            return Ok(ops);
+        }
+        self.store
+            .load_cgka_ops(doc)
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))
+    }
+
+    /// The prekey operations of `id` this replica knows: the ones loaded and
+    /// the ones its store holds, or `None` if it knows none.
+    async fn held_prekey_ops(&self, id: Identifier) -> Result<Option<CaMap<KeyOp>>, HydrateError> {
+        let mut ops = match self.individual_state(IndividualId(id)).await {
+            Some(state) => state.lock().await.prekey_ops().clone(),
+            None => CaMap::new(),
+        };
+        for op in self
+            .store
+            .load_prekey_ops(IndividualId(id))
+            .await
+            .map_err(|e| HydrateError::Store(Box::new(e)))?
+        {
+            ops.insert(op);
+        }
+        Ok((!ops.is_empty()).then_some(ops))
     }
 
     /// Every CGKA operation in this replica's CGKA graph for `doc`, joined or
@@ -2916,7 +3060,7 @@ where
     pub async fn reachable_prekey_ops_for_agent(
         &self,
         who: impl Into<Identifier>,
-    ) -> Result<KeyOps, KeylineStorageError<K::Error>> {
+    ) -> Result<KeyOps, HydrateError> {
         Ok(self.ops_for_agent(who.into()).await?.2)
     }
 
@@ -2929,7 +3073,7 @@ where
     #[instrument(skip_all)]
     pub async fn reachable_prekey_ops_for_all_agents(
         &self,
-    ) -> Result<AllReachablePrekeyOps, KeylineStorageError<K::Error>> {
+    ) -> Result<AllReachablePrekeyOps, HydrateError> {
         let views = self.subject_views().await?;
         let all_cgka = self.cgka_ops_for_all_agents().await?;
         self.prekey_ops_for_views(&views, &all_cgka).await
@@ -2943,7 +3087,7 @@ where
         &self,
         views: &[SubjectView<T>],
         all_cgka: &AllCgkaOps,
-    ) -> Result<AllReachablePrekeyOps, KeylineStorageError<K::Error>> {
+    ) -> Result<AllReachablePrekeyOps, HydrateError> {
         let active_id: Identifier = { self.active.id().into() };
 
         // What each source references.
@@ -2954,7 +3098,7 @@ where
         for view in views {
             let referenced = referenced_by_closure.entry(view.subject).or_default();
             for cert in &view.closure {
-                referenced.extend(referenced_by(cert)?);
+                referenced.extend(referenced_by::<_, K::Error>(cert)?);
             }
             for member in view.live.iter().chain([&view.subject]) {
                 sources.entry(*member).or_default().insert(view.subject);
@@ -2962,7 +3106,7 @@ where
             for (who, certs) in &view.cut {
                 let referenced = referenced_by_explanation.entry(*who).or_default();
                 for cert in certs {
-                    referenced.extend(referenced_by(cert)?);
+                    referenced.extend(referenced_by::<_, K::Error>(cert)?);
                 }
             }
         }
@@ -2987,6 +3131,14 @@ where
             .keys()
             .map(|id| (*id).into())
             .collect();
+        agents.extend(
+            self.store
+                .list_individuals()
+                .await
+                .map_err(|e| HydrateError::Store(Box::new(e)))?
+                .into_iter()
+                .map(Identifier::from),
+        );
         agents.insert(active_id);
         agents.extend(sources.keys().copied());
         agents.extend(referenced_by_explanation.keys().copied());
@@ -3008,8 +3160,8 @@ where
         let mut key_ops_cache: HashMap<Identifier, CaMap<KeyOp>> = HashMap::new();
         let candidates: BTreeSet<Identifier> = index.values().flatten().copied().collect();
         for id in candidates {
-            if let Some(state) = self.individual_state(IndividualId(id)).await {
-                key_ops_cache.insert(id, state.lock().await.prekey_ops().clone());
+            if let Some(ops) = self.held_prekey_ops(id).await? {
+                key_ops_cache.insert(id, ops);
             }
         }
         for needs in index.values_mut() {
@@ -3026,32 +3178,12 @@ where
     /// each CGKA graph this replica holds, joined or not, sent to every member
     /// of the document, relays included.
     #[instrument(skip_all)]
-    pub async fn cgka_ops_for_all_agents(
-        &self,
-    ) -> Result<AllCgkaOps, KeylineStorageError<K::Error>> {
+    pub async fn cgka_ops_for_all_agents(&self) -> Result<AllCgkaOps, HydrateError> {
         let mut ops: HashMap<Identifier, Vec<Arc<Verified<CgkaOperation>>>> = HashMap::new();
         let mut index: HashMap<Identifier, HashSet<Identifier>> = HashMap::new();
 
-        let docs: Vec<(DocumentId, Arc<Mutex<DocumentState<T>>>)> = {
-            let documents = self.documents.lock().await;
-            documents
-                .iter()
-                .map(|(id, doc)| (*id, doc.dupe()))
-                .collect()
-        };
-        let mut held = Vec::with_capacity(docs.len());
-        for (doc_id, doc) in docs {
-            held.push((doc_id, cgka_ops_for(doc.lock().await.cgka())));
-        }
-        held.extend(
-            self.unjoined
-                .lock()
-                .await
-                .iter()
-                .map(|(doc_id, cgka)| (*doc_id, cgka_ops_for(cgka))),
-        );
-
-        for (doc_id, doc_ops) in held {
+        for doc_id in self.held_documents().await? {
+            let doc_ops = self.held_cgka_ops(doc_id).await?;
             if doc_ops.is_empty() {
                 continue;
             }
@@ -3069,7 +3201,7 @@ where
     pub async fn event_digests_for_agent(
         &self,
         agent: impl Into<Identifier>,
-    ) -> Result<HashSet<EventDigest<T>>, KeylineStorageError<K::Error>> {
+    ) -> Result<HashSet<EventDigest<T>>, HydrateError> {
         let (certs, cgka_ops, prekeys) = self.ops_for_agent(agent.into()).await?;
         let mut digests = HashSet::new();
 
@@ -3090,9 +3222,7 @@ where
     }
 
     /// Every event each principal is sent, gathered once and deduplicated.
-    pub async fn all_agent_events(
-        &self,
-    ) -> Result<AllAgentEvents<T>, KeylineStorageError<K::Error>> {
+    pub async fn all_agent_events(&self) -> Result<AllAgentEvents<T>, HydrateError> {
         let views = self.subject_views().await?;
         let all_cgka = self.cgka_ops_for_all_agents().await?;
         let all_prekey = self.prekey_ops_for_views(&views, &all_cgka).await?;

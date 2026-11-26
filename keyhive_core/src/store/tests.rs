@@ -23,6 +23,7 @@ use future_form::{FutureForm, Sendable};
 use futures::lock::Mutex;
 use keyhive_content::{encrypted::EncryptedContent, store::memory::MemoryCiphertextStore};
 use keyhive_crypto::{
+    identifier::Identifier,
     signer::memory::MemorySigner,
     verified::{Signed, Verified},
 };
@@ -32,6 +33,7 @@ use keyline::{
 };
 use keyline_memory::MemoryKeyline;
 use nonempty::nonempty;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{collections::BTreeSet, sync::Arc};
 use testresult::TestResult;
 
@@ -787,5 +789,218 @@ async fn an_archive_written_to_a_store_opens_as_the_same_replica() -> TestResult
         answers(&s.bob.hive, s.doc, &s.first, &s.reply).await?,
         answers(&reopened, s.doc, &s.first, &s.reply).await?
     );
+    Ok(())
+}
+
+/// Everything a replica says to peers and about its size, as digests, so that
+/// replicas that know the same things compare equal however they came to know them.
+async fn served(hive: &Hive, agents: &[Identifier]) -> TestResult<Served> {
+    let all = hive.all_agent_events().await?;
+    let mut per_agent = Vec::new();
+    for agent in agents {
+        per_agent.push((
+            hive.static_events_for_agent(*agent)
+                .await?
+                .keys()
+                .map(|digest| <[u8; 32]>::from(*digest))
+                .collect(),
+            hive.event_digests_for_agent(*agent)
+                .await?
+                .into_iter()
+                .map(<[u8; 32]>::from)
+                .collect(),
+            all.digests_for(*agent)
+                .into_iter()
+                .map(<[u8; 32]>::from)
+                .collect(),
+        ));
+    }
+    Ok(Served {
+        per_agent,
+        all_events: all.events.keys().map(|d| <[u8; 32]>::from(*d)).collect(),
+        total_ops: hive.total_ops().await?,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Served {
+    /// Per agent: the events it is sent, from `static_events_for_agent`,
+    /// `event_digests_for_agent` and `all_agent_events`.
+    per_agent: Vec<(BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>)>,
+    all_events: BTreeSet<[u8; 32]>,
+    total_ops: u64,
+}
+
+/// Every pair of replicas exchanges what it is sent.
+async fn sync_all(nodes: &[Node]) -> TestResult {
+    for from in nodes {
+        for to in nodes {
+            if from.hive.id() != to.hive.id() {
+                to.receive_from(from).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replicas that found documents, add and remove members, write, and sync, as
+/// `seed` decides.
+async fn random_history(seed: u64) -> TestResult<Vec<Node>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut nodes = Vec::new();
+    for _ in 0..4 {
+        nodes.push(Node::new().await);
+    }
+    for from in &nodes {
+        for to in &nodes {
+            if from.hive.id() != to.hive.id() {
+                to.learn_individual(from).await;
+            }
+        }
+    }
+    for n in 0..rng.gen_range(1..=3u8) {
+        let creator = rng.gen_range(0..nodes.len());
+        let genesis = content_ref(&[seed as u8, n]);
+        let doc = nodes[creator]
+            .hive
+            .generate_doc(vec![], nonempty![genesis])
+            .await?;
+        nodes[creator]
+            .hive
+            .set_content_heads(doc, [genesis])
+            .await?;
+        KeyhiveStore::<Sendable, Ref>::put_content_heads(&nodes[creator].store, doc, &[genesis])
+            .await?;
+        let mut editors = vec![creator];
+        let mut readers = Vec::new();
+        for other in (0..nodes.len()).filter(|other| *other != creator) {
+            if !rng.gen_bool(0.7) {
+                continue;
+            }
+            let power = if rng.gen_bool(0.5) {
+                editors.push(other);
+                Power::Edit
+            } else {
+                readers.push(other);
+                Power::Read
+            };
+            nodes[creator]
+                .hive
+                .add_member(nodes[other].hive.id(), doc, power)
+                .await?;
+            nodes[other].receive_from(&nodes[creator]).await?;
+        }
+        for w in 0..rng.gen_range(1..=4u8) {
+            let writer = &nodes[editors[rng.gen_range(0..editors.len())]];
+            write(&writer.hive, &writer.store, doc, &[seed as u8, n, w], &[]).await?;
+            sync_all(&nodes).await?;
+        }
+        if !readers.is_empty() && rng.gen_bool(0.5) {
+            let removed = readers[rng.gen_range(0..readers.len())];
+            nodes[creator]
+                .hive
+                .revoke_member(nodes[removed].hive.id(), true, doc)
+                .await?;
+            write(
+                &nodes[creator].hive,
+                &nodes[creator].store,
+                doc,
+                &[seed as u8, n, 9],
+                &[],
+            )
+            .await?;
+            sync_all(&nodes).await?;
+        }
+    }
+    Ok(nodes)
+}
+
+/// A keyhive opened from its store serves peers and counts its operations as
+/// one that loaded everything first does, and loads no document to do it.
+#[tokio::test]
+async fn serving_an_unloaded_keyhive_answers_like_a_loaded_one() -> TestResult {
+    for seed in 0..6 {
+        let nodes = random_history(seed).await?;
+        let stranger = Node::new().await;
+        let agents: Vec<Identifier> = nodes
+            .iter()
+            .chain([&stranger])
+            .map(|node| node.hive.id().into())
+            .collect();
+        for node in &nodes {
+            let lazy = node.reopened().await?;
+            let from_lazy = served(&lazy, &agents).await?;
+            // Serving reads rows without loading a document, which `cgka_ops_for_doc` would show.
+            for doc in KeyhiveStore::<Sendable, Ref>::list_documents(&node.store).await? {
+                assert!(
+                    lazy.cgka_ops_for_doc(&doc).await.is_none() && !lazy.has_document(doc).await,
+                    "seed {seed}: serving loaded a document"
+                );
+            }
+
+            let eager = node.restarted().await?;
+            assert_eq!(
+                from_lazy,
+                served(&eager, &agents).await?,
+                "seed {seed}: unloaded and loaded keyhives differ"
+            );
+            assert_eq!(from_lazy.total_ops, eager.stats().await.total_ops());
+            assert_eq!(
+                from_lazy,
+                served(&node.hive, &agents).await?,
+                "seed {seed}: reopened and never restarted keyhives differ"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A count of operations does not move when a document is loaded, and grows
+/// when an operation is added.
+#[tokio::test]
+async fn hydrating_a_document_does_not_change_the_count_of_operations() -> TestResult {
+    let s = scenario().await?;
+    let reopened = s.bob.reopened().await?;
+    let before = reopened.total_ops().await?;
+    assert!(before > 0);
+    reopened.hydrate(s.doc).await?;
+    assert_eq!(before, reopened.total_ops().await?);
+
+    let carol = Node::new().await;
+    s.alice.learn_individual(&carol).await;
+    let before = s.alice.hive.total_ops().await?;
+    s.alice
+        .hive
+        .add_member(carol.hive.id(), s.doc, Power::Read)
+        .await?;
+    assert!(s.alice.hive.total_ops().await? > before);
+    Ok(())
+}
+
+/// A CGKA operation for a document that is not loaded waits, and the keyhive
+/// names that document, so the caller loads it before ingesting again.
+#[tokio::test]
+async fn waiting_operations_name_their_documents() -> TestResult {
+    let alice = Node::new().await;
+    let bob = Node::new().await;
+    alice.learn_individual(&bob).await;
+    let doc = alice
+        .hive
+        .generate_doc(vec![], nonempty![content_ref(b"genesis")])
+        .await?;
+    alice
+        .hive
+        .add_member(bob.hive.id(), doc, Power::Edit)
+        .await?;
+    let events: Vec<_> = alice
+        .hive
+        .static_events_for_agent(bob.hive.id())
+        .await?
+        .into_values()
+        .filter(|event| matches!(event, StaticEvent::CgkaOperation(_)))
+        .collect();
+    assert!(bob.hive.pending_documents().await.is_empty());
+    bob.hive.ingest_unsorted_static_events(events).await;
+    assert_eq!(bob.hive.pending_documents().await, BTreeSet::from([doc]));
     Ok(())
 }

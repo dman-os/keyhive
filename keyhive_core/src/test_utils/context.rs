@@ -178,6 +178,7 @@ other_from!(
     CgkaError,
     CertificateError,
     KeylineStorageError<Infallible>,
+    crate::store::HydrateError,
     keyhive_crypto::identifier::InvalidIdentifier,
     ReceiveCertificateError<Infallible>,
     ReceivePrekeyOpError,

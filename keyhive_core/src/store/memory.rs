@@ -143,6 +143,17 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
         F::ready(Ok(digests))
     }
 
+    fn count_prekey_ops(&self) -> F::Future<'_, Result<BTreeMap<IndividualId, u64>, Self::Error>> {
+        let counts = self
+            .lock()
+            .prekey_ops
+            .iter()
+            .filter(|(_, held)| !held.is_empty())
+            .map(|(who, held)| (*who, held.len() as u64))
+            .collect();
+        F::ready(Ok(counts))
+    }
+
     fn list_individuals(&self) -> F::Future<'_, Result<Vec<IndividualId>, Self::Error>> {
         F::ready(Ok(self.lock().prekey_ops.keys().copied().collect()))
     }
@@ -194,6 +205,17 @@ impl<F: FutureForm, T: ContentRef> KeyhiveStore<F, T> for MemoryKeyhiveStore<T> 
             })
             .unwrap_or_default();
         F::ready(Ok(rows))
+    }
+
+    fn count_cgka_ops(&self) -> F::Future<'_, Result<BTreeMap<DocumentId, u64>, Self::Error>> {
+        let counts = self
+            .lock()
+            .cgka_ops
+            .iter()
+            .filter(|(_, held)| !held.is_empty())
+            .map(|(doc, held)| (*doc, held.len() as u64))
+            .collect();
+        F::ready(Ok(counts))
     }
 
     fn append_cgka_ops<'a>(

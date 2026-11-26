@@ -41,6 +41,13 @@
 //! one that returns a `bool` or an `Option` answers from what is loaded.
 //! [`Keyhive::evict`][crate::keyhive::Keyhive::evict] forgets a document, to load it
 //! again after another process changed it.
+//!
+//! Serving does not load. What a peer is sent
+//! ([`Keyhive::events_for_agent`][crate::keyhive::Keyhive::events_for_agent],
+//! [`Keyhive::all_agent_events`][crate::keyhive::Keyhive::all_agent_events]) and
+//! [`Keyhive::total_ops`][crate::keyhive::Keyhive::total_ops] read the store's
+//! operations for what is not loaded, and the loaded state for what is, and
+//! leave the store's documents unloaded.
 
 pub mod memory;
 
@@ -116,6 +123,11 @@ pub trait KeyhiveStore<F: FutureForm, T: ContentRef> {
         who: IndividualId,
     ) -> F::Future<'_, Result<Vec<Digest<KeyOp>>, Self::Error>>;
 
+    /// How many prekey operations each individual has here, without loading
+    /// them: what a caller that serves a peer compares to see whether anything
+    /// changed. Individuals without any are left out.
+    fn count_prekey_ops(&self) -> F::Future<'_, Result<BTreeMap<IndividualId, u64>, Self::Error>>;
+
     /// Every individual with prekey operations here.
     fn list_individuals(&self) -> F::Future<'_, Result<Vec<IndividualId>, Self::Error>>;
 
@@ -144,6 +156,10 @@ pub trait KeyhiveStore<F: FutureForm, T: ContentRef> {
         &self,
         doc: DocumentId,
     ) -> F::Future<'_, Result<Vec<CgkaOpIndexRow>, Self::Error>>;
+
+    /// How many CGKA operations each document has here, without loading them:
+    /// a backend counts rows. Documents without any are left out.
+    fn count_cgka_ops(&self) -> F::Future<'_, Result<BTreeMap<DocumentId, u64>, Self::Error>>;
 
     /// Keep CGKA operations of `doc`. Keeping one again changes nothing.
     fn append_cgka_ops<'a>(
@@ -267,7 +283,7 @@ pub struct CgkaOpIndexRow {
 #[cfg(test)]
 mod tests;
 
-/// Why loading from a store or from Keyline for it failed.
+/// Why reading from a store or from Keyline for it failed.
 #[derive(Debug, Error)]
 pub enum HydrateError {
     /// The store failed.
@@ -277,4 +293,12 @@ pub enum HydrateError {
     /// Keyline failed to answer for what was loaded.
     #[error("Keyline failed: {0}")]
     Keyline(Box<dyn core::error::Error + Send + Sync>),
+}
+
+impl<E: core::error::Error + Send + Sync + 'static> From<crate::certificate::KeylineStorageError<E>>
+    for HydrateError
+{
+    fn from(error: crate::certificate::KeylineStorageError<E>) -> Self {
+        HydrateError::Keyline(Box::new(error))
+    }
 }
