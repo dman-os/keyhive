@@ -3399,6 +3399,19 @@ where
         if self.is_loaded(doc_id).await {
             return Ok(());
         }
+        if self.evicted.lock().await.contains(&doc_id) {
+            // Read again because the store is ahead of this instance, which holds the leaf
+            // secrets it generated or imported and not those the store gained since: a write
+            // whose commit landed but was never applied here (refused as stale, or reported
+            // lost) rotated a leaf whose secret only the store has. Without it the replayed
+            // graph holds the rotation and cannot derive what it wrapped.
+            let stored = self
+                .store
+                .load_key_pairs()
+                .await
+                .map_err(|e| HydrateError::Store(Box::new(e)))?;
+            self.active.key_pairs.lock().await.extend(stored);
+        }
         let ops = self
             .store
             .load_cgka_ops(doc_id)

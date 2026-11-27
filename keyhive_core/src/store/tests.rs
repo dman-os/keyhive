@@ -1004,3 +1004,102 @@ async fn waiting_operations_name_their_documents() -> TestResult {
     assert_eq!(bob.hive.pending_documents().await, BTreeSet::from([doc]));
     Ok(())
 }
+
+/// A write whose commit landed (its operation, its leaf secret and its content key are in the
+/// store) but whose preparation was never applied here, because the commit was reported lost, can be
+/// read once the document is read from the store again: the replayed graph holds the rotation, and
+/// the secret of the leaf it rotated to comes from the store too, not only from what this
+/// instance generated.
+#[tokio::test]
+async fn a_write_that_landed_and_was_never_applied_opens_once_the_document_is_read_again(
+) -> TestResult {
+    let alice = Node::new().await;
+    let bob = Node::new().await;
+    alice.learn_individual(&bob).await;
+    let doc = alice
+        .hive
+        .generate_doc(vec![], nonempty![content_ref(b"genesis")])
+        .await?;
+    alice
+        .hive
+        .add_member(bob.hive.id(), doc, Power::Edit)
+        .await?;
+
+    let cr = content_ref(b"lost");
+    let prepared = alice
+        .hive
+        .prepare_encrypt_content(doc, &cr, &[], b"lost", &[])
+        .await?;
+    assert!(prepared.rotation().is_some(), "the first write rotates");
+    keep_preparation(&alice.store, &prepared).await;
+    let encrypted = prepared.encrypted_content().clone();
+    drop(prepared);
+
+    // not applied: this instance holds neither the rotation nor its secret
+    assert!(matches!(
+        alice.hive.try_decrypt_content_keyed(doc, &encrypted).await,
+        Err(DecryptError::KeyNotFound)
+    ));
+
+    alice.hive.evict(doc).await;
+    alice.hive.hydrate(doc).await?;
+    assert_eq!(
+        read(&alice.hive, &alice.store, doc, &encrypted).await?,
+        b"lost"
+    );
+    Ok(())
+}
+
+/// A membership change that ran between a write's commit and its apply makes the apply stale, and
+/// the document is read again from the store: the write opens, though its rotation is concurrent
+/// with the change.
+#[tokio::test]
+async fn a_write_opens_after_a_membership_change_ran_between_its_commit_and_its_apply() -> TestResult
+{
+    let alice = Node::new().await;
+    let bob = Node::new().await;
+    let carol = Node::new().await;
+    alice.learn_individual(&bob).await;
+    alice.learn_individual(&carol).await;
+    let doc = alice
+        .hive
+        .generate_doc(vec![], nonempty![content_ref(b"genesis")])
+        .await?;
+    alice
+        .hive
+        .add_member(bob.hive.id(), doc, Power::Edit)
+        .await?;
+
+    let cr = content_ref(b"raced");
+    let prepared = alice
+        .hive
+        .prepare_encrypt_content(doc, &cr, &[], b"raced", &[])
+        .await?;
+    keep_preparation(&alice.store, &prepared).await;
+    let encrypted = prepared.encrypted_content().clone();
+
+    // the change runs on memory that does not hold the rotation, and is kept
+    alice
+        .hive
+        .add_member(carol.hive.id(), doc, Power::Read)
+        .await?;
+    for op in alice.hive.cgka_ops_for_doc(&doc).await.expect("held") {
+        KeyhiveStore::<Sendable, Ref>::append_cgka_ops(&alice.store, doc, &[op]).await?;
+    }
+    assert!(
+        alice
+            .hive
+            .apply_prepared_encryption(prepared)
+            .await
+            .is_err(),
+        "the apply is stale"
+    );
+
+    alice.hive.evict(doc).await;
+    alice.hive.hydrate(doc).await?;
+    assert_eq!(
+        read(&alice.hive, &alice.store, doc, &encrypted).await?,
+        b"raced"
+    );
+    Ok(())
+}
