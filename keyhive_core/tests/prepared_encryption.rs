@@ -40,7 +40,7 @@ async fn a_dropped_preparation_leaves_the_keyhive_byte_identical() -> Result<()>
 
     let before = bob.into_archive().await?;
     let prepared = bob
-        .prepare_encrypt_content(doc, &content_ref, &[], content)
+        .prepare_encrypt_content(doc, &content_ref, &[], content, &[])
         .await?;
     assert!(
         prepared.rotation().is_some(),
@@ -65,7 +65,7 @@ async fn write_twice(prepare_and_apply: bool) -> Result<(bool, bool, bool)> {
     let first = b"first";
     let (written, key) = if prepare_and_apply {
         let prepared = bob
-            .prepare_encrypt_content(doc, &content_ref(first), &[], first)
+            .prepare_encrypt_content(doc, &content_ref(first), &[], first, &[])
             .await?;
         bob.apply_prepared_encryption(prepared).await?
     } else {
@@ -109,10 +109,10 @@ async fn a_second_preparation_is_refused_once_the_first_rotated() -> Result<()> 
     let (mut ctx, alice, bob, doc) = alice_and_bob().await?;
     let (one, two) = (b"one", b"two");
     let first = bob
-        .prepare_encrypt_content(doc, &content_ref(one), &[], one)
+        .prepare_encrypt_content(doc, &content_ref(one), &[], one, &[])
         .await?;
     let second = bob
-        .prepare_encrypt_content(doc, &content_ref(two), &[], two)
+        .prepare_encrypt_content(doc, &content_ref(two), &[], two, &[])
         .await?;
     assert!(first.rotation().is_some() && second.rotation().is_some());
 
@@ -136,7 +136,7 @@ async fn a_second_preparation_is_refused_once_the_first_rotated() -> Result<()> 
 
     // Preparing again, from the state the first write left, works and reads.
     let again = bob
-        .prepare_encrypt_content(doc, &content_ref(two), &[], two)
+        .prepare_encrypt_content(doc, &content_ref(two), &[], two, &[])
         .await?;
     let (written, _) = bob.apply_prepared_encryption(again).await?;
     ctx.sync(&bob, &alice).await?;
@@ -153,7 +153,7 @@ async fn a_preparation_is_refused_after_another_member_changed_the_group() -> Re
     let (mut ctx, alice, bob, doc) = alice_and_bob().await?;
     let content = b"late";
     let prepared = bob
-        .prepare_encrypt_content(doc, &content_ref(content), &[], content)
+        .prepare_encrypt_content(doc, &content_ref(content), &[], content, &[])
         .await?;
 
     alice.force_pcs_update(doc).await?;
@@ -222,7 +222,7 @@ async fn the_listener_hears_of_the_rotation_at_apply_only() -> Result<()> {
     bob_log.clear().await;
 
     let prepared = bob
-        .prepare_encrypt_content(doc, &heads, &[], content)
+        .prepare_encrypt_content(doc, &heads, &[], content, &[])
         .await?;
     assert!(prepared.rotation().is_some());
     let announced_by_preparing = bob_log.len().await;
@@ -231,7 +231,7 @@ async fn the_listener_hears_of_the_rotation_at_apply_only() -> Result<()> {
 
     bob_log.clear().await;
     let prepared = bob
-        .prepare_encrypt_content(doc, &heads, &[], content)
+        .prepare_encrypt_content(doc, &heads, &[], content, &[])
         .await?;
     assert_eq!(bob_log.len().await, 0, "preparing a write is silent");
     let (written, _) = bob.apply_prepared_encryption(prepared).await?;
@@ -241,5 +241,88 @@ async fn the_listener_hears_of_the_rotation_at_apply_only() -> Result<()> {
         1,
         "applying announces the rotation, once"
     );
+    Ok(())
+}
+
+/// Bob writes a burst of three, each naming the one before as its predecessor, and
+/// persists nothing between them: his first write rotates, and later preparations
+/// must neither lose the earlier keys nor rotate again and end up stale.
+#[tokio::test]
+async fn a_batch_prepared_before_any_is_applied_applies_in_order_and_chains_keys() -> Result<()> {
+    let (mut ctx, alice, bob, doc) = alice_and_bob().await?;
+    let (one, two, three) = (b"one", b"two", b"three");
+    let (cr_one, cr_two, cr_three) = (content_ref(one), content_ref(two), content_ref(three));
+
+    let first = bob
+        .prepare_encrypt_content(doc, &cr_one, &[], one, &[])
+        .await?;
+    assert!(
+        first.rotation().is_some(),
+        "precondition: the first write rotates"
+    );
+    // Without `earlier` the second would find no key for `cr_one` among the stored ones.
+    let unaware = bob
+        .prepare_encrypt_content(doc, &cr_two, &[cr_one], two, &[])
+        .await;
+    assert!(
+        matches!(unaware, Err(EncryptContentError::NoKeyForPredecessor(_))),
+        "got {unaware:?}"
+    );
+    let second = bob
+        .prepare_encrypt_content(doc, &cr_two, &[cr_one], two, &[&first])
+        .await?;
+    assert!(
+        second.rotation().is_none(),
+        "the first write's rotation covers the second"
+    );
+    let third = bob
+        .prepare_encrypt_content(doc, &cr_three, &[cr_two], three, &[&first, &second])
+        .await?;
+    assert!(third.rotation().is_none());
+
+    let (w1, key_one) = bob.apply_prepared_encryption(first).await?;
+    let (w2, key_two) = bob.apply_prepared_encryption(second).await?;
+    let (w3, _) = bob.apply_prepared_encryption(third).await?;
+    assert!(w1.update_op().is_some() && w2.update_op().is_none() && w3.update_op().is_none());
+
+    ctx.sync(&bob, &alice).await?;
+    let read_three = alice
+        .try_decrypt_content(doc, w3.encrypted_content())
+        .await?;
+    assert_eq!(read_three.plaintext, three);
+    assert_eq!(
+        read_three.ancestors.get(&cr_two),
+        Some(&key_two),
+        "the third lists the second's key, though it was never stored when preparing"
+    );
+    let read_two = alice
+        .try_decrypt_content(doc, w2.encrypted_content())
+        .await?;
+    assert_eq!(
+        read_two.ancestors.get(&cr_one),
+        Some(&key_one)
+    );
+    // Applying remembered each key, so the next burst can name the last as before.
+    assert!(bob.has_key_for(doc, &cr_three).await);
+    Ok(())
+}
+
+/// A batch whose first write needs no rotation still chains, and dropping the
+/// batch leaves the keyhive byte-identical.
+#[tokio::test]
+async fn a_dropped_batch_leaves_the_keyhive_byte_identical() -> Result<()> {
+    let (_ctx, _alice, bob, doc) = alice_and_bob().await?;
+    let (one, two) = (b"one", b"two");
+    let (cr_one, cr_two) = (content_ref(one), content_ref(two));
+    let before = bob.into_archive().await?;
+    let first = bob
+        .prepare_encrypt_content(doc, &cr_one, &[], one, &[])
+        .await?;
+    let second = bob
+        .prepare_encrypt_content(doc, &cr_two, &[cr_one], two, &[&first])
+        .await?;
+    drop((first, second));
+    assert!(before == bob.into_archive().await?);
+    assert!(!bob.has_key_for(doc, &cr_one).await);
     Ok(())
 }

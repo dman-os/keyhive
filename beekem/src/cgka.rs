@@ -438,11 +438,21 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
     /// this tree so that nothing here changes. The caller persists what the plan
     /// carries, then hands it to [`Self::apply_write`].
     ///
-    /// Dropping the plan leaves no trace. Two plans made from the same state both
-    /// apply only if neither rotates, as the first rotation changes the graph
-    /// and the second plan is then refused as stale.
+    /// `earlier` are plans of a batch prepared before this one and not applied yet,
+    /// in the order they will be applied. This plan is made as if they were applied
+    /// first: a rotation among them is already in the tree this plan reads, so this
+    /// plan encrypts under the secret that rotation produced and rotates nothing
+    /// itself, and its base is the graph after them. Applying the batch in order
+    /// then leaves no plan stale. Applied out of order, or without one of
+    /// `earlier`, this plan is refused as stale.
     ///
-    /// Copies the whole tree and graph. Errors as `group_secret_for_write` does.
+    /// Dropping the plan leaves no trace. Two plans made from the same state with
+    /// no `earlier` both apply only if neither rotates, as the first rotation
+    /// changes the graph and the second plan is then refused as stale.
+    ///
+    /// Copies the whole tree and graph. Errors as `group_secret_for_write` does,
+    /// and as [`Self::apply_write`] does for an `earlier` plan that does not apply
+    /// to this group.
     #[instrument(skip_all)]
     pub async fn prepare_write<
         F: FutureForm,
@@ -450,10 +460,14 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
         R: rand::CryptoRng + rand::RngCore,
     >(
         &self,
+        earlier: &[&WritePlan],
         signer: &S,
         csprng: &mut R,
     ) -> Result<WritePlan, CgkaError> {
         let mut scratch = self.clone();
+        for plan in earlier {
+            scratch.apply_write((*plan).clone())?;
+        }
         let mut plan = scratch.plan_write::<F, S, R>(signer, csprng).await?;
         plan.derived = scratch.root_secrets;
         Ok(plan)

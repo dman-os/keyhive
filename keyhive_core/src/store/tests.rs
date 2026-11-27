@@ -250,7 +250,7 @@ async fn write(
 ) -> TestResult<EncryptedContent<Vec<u8>, Ref>> {
     let cr = content_ref(content);
     let prepared: PreparedContent<Ref> = hive
-        .prepare_encrypt_content(doc, &cr, preds, content)
+        .prepare_encrypt_content(doc, &cr, preds, content, &[])
         .await?;
     keep_preparation(store, &prepared).await;
     let (written, _) = hive.apply_prepared_encryption(prepared).await?;
@@ -668,7 +668,7 @@ async fn preparing_returns_the_rotation_of_a_retired_prekey_until_a_write_applie
     let preds = [content_ref(b"first")];
     let prepared = bob
         .hive
-        .prepare_encrypt_content(doc, &cr, &preds, b"reply")
+        .prepare_encrypt_content(doc, &cr, &preds, b"reply", &[])
         .await?;
     assert_eq!(prepared.preliminary().cgka_ops.len(), 1);
     assert_eq!(prepared.preliminary().key_pairs.len(), 1);
@@ -678,7 +678,7 @@ async fn preparing_returns_the_rotation_of_a_retired_prekey_until_a_write_applie
     // The transaction rolled back: the next preparation carries it again.
     let prepared = bob
         .hive
-        .prepare_encrypt_content(doc, &cr, &preds, b"reply")
+        .prepare_encrypt_content(doc, &cr, &preds, b"reply", &[])
         .await?;
     assert_eq!(prepared.preliminary().cgka_ops.len(), 1);
     assert_eq!(prepared.preliminary().key_pairs[0].0, rotated_to);
@@ -688,7 +688,7 @@ async fn preparing_returns_the_rotation_of_a_retired_prekey_until_a_write_applie
     // Acknowledged by applying: not repeated.
     let next = bob
         .hive
-        .prepare_encrypt_content(doc, &content_ref(b"more"), &[cr], b"more")
+        .prepare_encrypt_content(doc, &content_ref(b"more"), &[cr], b"more", &[])
         .await?;
     assert!(next.preliminary().is_empty());
 

@@ -7,6 +7,9 @@
 //! 3. A plan made from an older graph is refused at apply and the refusal
 //!    changes nothing.
 //! 4. Of any number of plans made from one state, at most one rotation lands.
+//! 5. A batch prepared in order, each plan naming the ones before it as `earlier`,
+//!    applies in that order without a stale refusal, and equals the same writes made
+//!    one shot after one shot: the first rotates if it has to, the rest do not.
 //!
 //! The oracle for 2 is the one-shot call itself, run on a copy of the same group
 //! with an identically seeded generator. The proptest drives both through random
@@ -102,17 +105,17 @@ async fn run(steps: &[Step], prepared: bool) -> (Vec<Written>, Vec<Replica>) {
                     let before = replicas[m].clone();
                     // A plan that is dropped leaves no trace.
                     let dropped = replicas[m]
-                        .prepare_write::<Local, _, _>(signer, &mut racing_rng)
+                        .prepare_write::<Local, _, _>(&[], signer, &mut racing_rng)
                         .await
                         .unwrap();
                     drop(dropped);
                     assert!(replicas[m] == before, "a dropped plan changed the group");
                     let plan = replicas[m]
-                        .prepare_write::<Local, _, _>(signer, &mut rng)
+                        .prepare_write::<Local, _, _>(&[], signer, &mut rng)
                         .await
                         .unwrap();
                     let racing = replicas[m]
-                        .prepare_write::<Local, _, _>(signer, &mut racing_rng)
+                        .prepare_write::<Local, _, _>(&[], signer, &mut racing_rng)
                         .await
                         .unwrap();
                     let (pcs_key, origin) = (plan.pcs_key().clone(), plan.origin());
@@ -169,7 +172,7 @@ async fn law_3_a_plan_from_an_older_graph_is_refused_and_changes_nothing() {
     let (mut group, mut replicas) = start().await;
     let mut rng = StdRng::seed_from_u64(0x9e_0004);
     let plan = replicas[1]
-        .prepare_write::<Local, _, _>(&group.members[1].signer, &mut rng)
+        .prepare_write::<Local, _, _>(&[], &group.members[1].signer, &mut rng)
         .await
         .unwrap();
 
@@ -185,8 +188,67 @@ async fn law_3_a_plan_from_an_older_graph_is_refused_and_changes_nothing() {
     assert!(replicas[1] == before, "a refused plan changed the group");
 
     let fresh = replicas[1]
-        .prepare_write::<Local, _, _>(&group.members[1].signer, &mut rng)
+        .prepare_write::<Local, _, _>(&[], &group.members[1].signer, &mut rng)
         .await
         .unwrap();
     replicas[1].apply_write(fresh).unwrap();
 }
+
+/// Law 5: three writes prepared before any is applied apply in order, and the
+/// group they leave is the one three one-shot writes leave.
+#[tokio::test]
+async fn law_5_a_batch_prepared_in_order_applies_in_order_like_one_shot_writes() {
+    let (mut group, mut batched) = start().await;
+    // Member 1 rotated and member 2 rotated concurrently: the root is conflicted, so
+    // member 1's next write has to rotate to cover both.
+    let mut rotation_rng = StdRng::seed_from_u64(0x9e_0006);
+    let sk = keyhive_crypto::share_key::ShareSecretKey::generate(&mut rotation_rng);
+    batched[1]
+        .update::<Local, _, _>(sk.share_key(), sk, &group.members[1].signer, &mut rotation_rng)
+        .await
+        .unwrap();
+    let concurrent = group.rotate(2, &mut rotation_rng).await;
+    batched[1].merge_concurrent_operation(concurrent).unwrap();
+    let mut one_shot = batched.clone();
+    let signer = &group.members[1].signer;
+    // The first write of member 1 must rotate: member 1 never wrote in this group.
+    let mut rng = StdRng::seed_from_u64(0x9e_0005);
+    let first = batched[1]
+        .prepare_write::<Local, _, _>(&[], signer, &mut rng)
+        .await
+        .unwrap();
+    let second = batched[1]
+        .prepare_write::<Local, _, _>(&[&first], signer, &mut rng)
+        .await
+        .unwrap();
+    let third = batched[1]
+        .prepare_write::<Local, _, _>(&[&first, &second], signer, &mut rng)
+        .await
+        .unwrap();
+    assert!(first.rotation().is_some(), "precondition: the first rotates");
+    assert!(
+        second.rotation().is_none() && third.rotation().is_none(),
+        "the first's rotation covers the rest"
+    );
+    let planned = [
+        (first.pcs_key().digest(), first.origin()),
+        (second.pcs_key().digest(), second.origin()),
+        (third.pcs_key().digest(), third.origin()),
+    ];
+    for plan in [first, second, third] {
+        batched[1].apply_write(plan).unwrap();
+    }
+
+    let mut rng = StdRng::seed_from_u64(0x9e_0005);
+    let mut done = Vec::new();
+    for _ in 0..3 {
+        let (pcs_key, origin, _) = one_shot[1]
+            .group_secret_for_write::<Local, _, _>(signer, &mut rng)
+            .await
+            .unwrap();
+        done.push((pcs_key.digest(), origin));
+    }
+    assert_eq!(planned.to_vec(), done);
+    assert!(batched[1] == one_shot[1], "the groups differ");
+}
+

@@ -288,6 +288,11 @@ impl<T: ContentRef> DocumentState<T> {
     /// any, held in a [`PreparedEncryption`]. Persist what that carries, then make
     /// the document current with [`Self::apply_prepared_encryption`]. Dropping it
     /// leaves the document as it was.
+    ///
+    /// `earlier` are the preparations of one batch made before this one and not
+    /// applied yet, in the order they will be applied. This write is prepared as
+    /// if they were applied first, so a rotation among them does not leave this
+    /// one stale: applying the batch in order succeeds for every write.
     #[instrument(skip_all)]
     pub async fn prepare_encrypt_content_keyed<
         F: FutureForm,
@@ -298,13 +303,15 @@ impl<T: ContentRef> DocumentState<T> {
         content_ref: &T,
         content: &[u8],
         ancestors: &[AncestorKey<T>],
+        earlier: &[&PreparedEncryption<T>],
         signer: &S,
         csprng: &mut R,
     ) -> Result<PreparedEncryption<T>, EncryptError> {
         let pred_refs: Vec<T> = ancestors.iter().map(|a| a.content_ref().clone()).collect();
+        let earlier_plans: Vec<&WritePlan> = earlier.iter().map(|e| &e.plan).collect();
         let (app_secret, plan) = self
             .cgka
-            .prepare_app_secret_for(content_ref, &pred_refs, signer, csprng)
+            .prepare_app_secret_for(content_ref, &pred_refs, &earlier_plans, signer, csprng)
             .await
             .map_err(EncryptError::FailedToMakeAppSecret)?;
         let (encrypted_content, own_key) = app_secret
@@ -601,6 +608,12 @@ impl<T: ContentRef> core::fmt::Debug for PreparedEncryption<T> {
 }
 
 impl<T: ContentRef> PreparedEncryption<T> {
+    /// The key the content is encrypted under, as a predecessor key for a later
+    /// write of the same batch.
+    pub(crate) fn own_key(&self) -> &AncestorKey<T> {
+        &self.own_key
+    }
+
     pub fn encrypted_content(&self) -> &EncryptedContent<Vec<u8>, T> {
         &self.encrypted_content
     }

@@ -2138,6 +2138,22 @@ where
     ///
     /// Once the caller has persisted what the result carries, [`Keyhive::apply_prepared_encryption`]
     /// applies it.
+    ///
+    /// `earlier` are the preparations of the same batch for `doc` made before this one,
+    /// in the order they will be applied, and not applied yet. A batch is a burst of
+    /// writes the caller persists in one transaction, so the later ones cannot find the
+    /// earlier ones' keys or CGKA rotation in what is stored. This write is prepared as
+    /// if they were applied first:
+    ///
+    /// - a ref in `pred_refs` that one of them wrote takes its key from that
+    ///   preparation, and any other is looked up among the keys stored as before, and
+    /// - a rotation among them is accounted for, so this write does not rotate again
+    ///   and applying the batch in order never refuses a write as stale.
+    ///
+    /// Apply the batch in the order it was prepared. If the earlier ones are dropped
+    /// instead, so is this one: applied without them it is refused as stale, or, if
+    /// the earlier writes needed no rotation, reads fine but its predecessor keys then
+    /// name content this replica never stored.
     #[instrument(skip_all)]
     pub async fn prepare_encrypt_content(
         &self,
@@ -2145,6 +2161,7 @@ where
         content_ref: &T,
         pred_refs: &[T],
         content: &[u8],
+        earlier: &[&PreparedContent<T>],
     ) -> Result<PreparedContent<T>, EncryptContentError<T>> {
         let writing = self.prepare_to_write(doc).await?;
         let prepared = async {
@@ -2153,15 +2170,37 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
-            self.load_content_keys(doc, &mut locked, pred_refs).await?;
-            let ancestors = locked
-                .predecessor_keys(pred_refs)
+            let earlier: Vec<&PreparedEncryption<T>> =
+                earlier.iter().map(|prepared| &prepared.encryption).collect();
+            let from_batch = |pred: &T| {
+                earlier
+                    .iter()
+                    .map(|prepared| prepared.own_key())
+                    .find(|key| key.content_ref() == pred)
+            };
+            let stored_refs: Vec<T> = pred_refs
+                .iter()
+                .filter(|pred| from_batch(pred).is_none())
+                .cloned()
+                .collect();
+            self.load_content_keys(doc, &mut locked, &stored_refs)
+                .await?;
+            let ancestors = pred_refs
+                .iter()
+                .map(|pred| match from_batch(pred) {
+                    Some(key) => Ok(key.clone()),
+                    None => locked
+                        .predecessor_keys(core::slice::from_ref(pred))
+                        .map(|mut stored| stored.remove(0)),
+                })
+                .collect::<Result<Vec<_>, T>>()
                 .map_err(EncryptContentError::NoKeyForPredecessor)?;
             locked
                 .prepare_encrypt_content_keyed(
                     content_ref,
                     content,
                     &ancestors,
+                    &earlier,
                     &signer,
                     &mut *locked_csprng,
                 )

@@ -174,6 +174,10 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
     /// secret and the [`WritePlan`] that produced it, which carries the rotation
     /// the write needs, if any. Make the group current with
     /// [`Self::apply_write`] after persisting what the plan carries.
+    ///
+    /// `earlier` are the plans of the writes of one batch prepared before this one
+    /// and not applied yet, in the order they will be applied: see BeeKEM's
+    /// `Cgka::prepare_write`.
     pub async fn prepare_app_secret_for<
         F: FutureForm,
         S: AsyncSigner<F>,
@@ -183,10 +187,11 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
         &self,
         content_ref: &T,
         pred_refs: &[T],
+        earlier: &[&WritePlan],
         signer: &S,
         csprng: &mut R,
     ) -> Result<(ApplicationSecret<T>, WritePlan), CgkaError> {
-        let plan = self.0.prepare_write(signer, csprng).await?;
+        let plan = self.0.prepare_write(earlier, signer, csprng).await?;
         let app_secret = GroupSecret(plan.pcs_key().0.clone()).derive_application_secret(
             content_ref,
             &PredecessorRefs::digest(pred_refs),
