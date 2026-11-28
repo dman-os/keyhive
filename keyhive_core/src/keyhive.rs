@@ -280,11 +280,12 @@ where
     ///
     /// What this identity holds that `store` must keep is [`Self::identity`].
     ///
-    /// This keyhive must be the only writer to the store behind `keyline`.
-    /// Moving `keyline` in ensures that for a backend that owns its data, such
-    /// as `MemoryKeyline`, but not for one that is a handle to shared storage,
-    /// such as a database: another handle writing to the same store would
-    /// bypass the insert lock, the listener and reconciliation.
+    /// This keyhive, and the siblings opened from it with
+    /// [`Self::open_sibling`], must be the only writers to the store behind
+    /// `keyline`. Moving `keyline` in ensures that for a backend that owns its
+    /// data, such as `MemoryKeyline`, but not for one that is a handle to
+    /// shared storage, such as a database: another handle writing to the same
+    /// store would bypass the insert lock, the listener and reconciliation.
     #[instrument(skip_all)]
     pub async fn generate(
         signer: S,
@@ -335,13 +336,76 @@ where
     /// `store` must hold what [`Self::generate`]d this identity
     /// ([`Self::identity`]), and what the caller has kept since (see
     /// [`crate::store`]). As with [`Self::generate`], this keyhive must be the
-    /// only writer to the store behind `keyline`.
+    /// only writer to the store behind `keyline`, unless it is opened with
+    /// [`Self::open_sibling`], which shares the Keyline store and its lock.
     #[instrument(skip_all)]
     pub async fn open(
         signer: S,
         ciphertext_store: C,
         event_listener: L,
         keyline: K,
+        store: H,
+        csprng: R,
+    ) -> Result<Self, OpenError<H::Error>> {
+        let certificates = Arc::new(Certificates {
+            store: keyline,
+            reconciled: async_lock::Mutex::new(None),
+            cited: SharedCitations::default(),
+        });
+        Self::open_sharing(
+            signer,
+            ciphertext_store,
+            event_listener,
+            certificates,
+            store,
+            csprng,
+        )
+        .await
+    }
+
+    /// Open another individual's replica over the same Keyline store as this
+    /// one: one store, one insert lock (so certificate inserts of the siblings
+    /// are serialized and each sees the version the other left, which is why
+    /// they do not warn that the store changed outside them) and one record of
+    /// what CGKA operations cite. Everything else is the sibling's own: its
+    /// identity, its documents' CGKA graphs, its waiting events, its
+    /// `store`.
+    ///
+    /// The siblings share a Keyline store but not CGKA graphs, so what one
+    /// issues or receives for a document reaches another's loaded copy only
+    /// when the caller [evicts](Self::evict) it there and it is
+    /// [hydrated](Self::hydrate) again from the store. As with a fork
+    /// ([`ForkAsync`] for `Keyhive`), a rolled back certificate insert is not
+    /// undone in the shared record of citations, so a caller that rolls back
+    /// drops every sibling and opens them again.
+    ///
+    /// `store` must be the sibling's: it holds the sibling's key pairs and
+    /// waiting events, and shares nothing secret with this keyhive's.
+    #[instrument(skip_all)]
+    pub async fn open_sibling(
+        &self,
+        signer: S,
+        ciphertext_store: C,
+        event_listener: L,
+        store: H,
+        csprng: R,
+    ) -> Result<Self, OpenError<H::Error>> {
+        Self::open_sharing(
+            signer,
+            ciphertext_store,
+            event_listener,
+            self.certificates.dupe(),
+            store,
+            csprng,
+        )
+        .await
+    }
+
+    async fn open_sharing(
+        signer: S,
+        ciphertext_store: C,
+        event_listener: L,
+        certificates: Arc<Certificates<K>>,
         store: H,
         csprng: R,
     ) -> Result<Self, OpenError<H::Error>> {
@@ -390,11 +454,7 @@ where
             ciphertext_store,
             event_listener,
             csprng: Arc::new(Mutex::new(csprng)),
-            certificates: Arc::new(Certificates {
-                store: keyline,
-                reconciled: async_lock::Mutex::new(None),
-                cited: SharedCitations::default(),
-            }),
+            certificates,
             _plaintext_phantom: PhantomData,
         })))
     }
@@ -2170,8 +2230,10 @@ where
             let mut locked_csprng = self.csprng.lock().await;
             let mut locked = handle.lock().await;
             self.settle_for_write(doc, &mut locked).await?;
-            let earlier: Vec<&PreparedEncryption<T>> =
-                earlier.iter().map(|prepared| &prepared.encryption).collect();
+            let earlier: Vec<&PreparedEncryption<T>> = earlier
+                .iter()
+                .map(|prepared| &prepared.encryption)
+                .collect();
             let from_batch = |pred: &T| {
                 earlier
                     .iter()
@@ -5758,6 +5820,67 @@ mod tests {
             members.get(&bob_id),
             Some(&Power::Edit),
             "membership composes through the group"
+        );
+        Ok(())
+    }
+
+    /// Siblings are two individuals over one Keyline store and one insert lock, and share no
+    /// secret: a certificate one writes is in the other's Keyline, and their key pairs are
+    /// disjoint.
+    #[tokio::test]
+    async fn siblings_share_the_keyline_store_and_no_secret() -> TestResult {
+        use crate::store::KeyhiveStore;
+
+        let hive = make_keyhive().await;
+        let signer = MemorySigner::generate(&mut rand::rngs::OsRng);
+        let store = crate::store::memory::MemoryKeyhiveStore::<[u8; 32]>::default();
+        let made: TestKeyhive = Keyhive::generate(
+            signer.clone(),
+            Arc::new(Mutex::new(MemoryCiphertextStore::new())),
+            NoListener,
+            MemoryKeyline::new(),
+            store.clone(),
+            rand::rngs::OsRng,
+        )
+        .await?;
+        let identity = made.identity().await;
+        let pairs: Vec<_> = identity.key_pairs.clone().into_iter().collect();
+        KeyhiveStore::<Sendable, [u8; 32]>::put_key_pairs(&store, &pairs).await?;
+        KeyhiveStore::<Sendable, [u8; 32]>::append_prekey_ops(
+            &store,
+            made.id(),
+            &identity.prekey_ops,
+        )
+        .await?;
+
+        let sibling = hive
+            .open_sibling(
+                signer,
+                Arc::new(Mutex::new(MemoryCiphertextStore::new())),
+                NoListener,
+                store,
+                rand::rngs::OsRng,
+            )
+            .await?;
+        assert_eq!(sibling.id(), made.id());
+        assert_ne!(sibling.id(), hive.id());
+        assert!(
+            Arc::ptr_eq(&hive.certificates, &sibling.certificates),
+            "the siblings share the Keyline store and its lock"
+        );
+
+        let doc_id = hive.generate_doc(vec![], nonempty![[1u8; 32]]).await?;
+        assert_eq!(
+            keyline_members(&sibling, doc_id).await,
+            BTreeMap::from([(Identifier::from(hive.id()), Power::Admin)]),
+            "a certificate one sibling wrote is in the other's Keyline"
+        );
+
+        let ours = hive.identity().await.key_pairs;
+        let theirs = sibling.identity().await.key_pairs;
+        assert!(
+            ours.keys().all(|key| !theirs.contains_key(key)),
+            "no key pair is shared between siblings"
         );
         Ok(())
     }
