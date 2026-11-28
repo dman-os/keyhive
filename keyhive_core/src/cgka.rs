@@ -38,6 +38,38 @@ use std::{
 };
 use tracing::instrument;
 
+/// A document's key epoch as an application names it: the group secret's hash and the update
+/// that produced the secret. Two members hold the same epoch exactly when both are equal, and
+/// neither is secret, so it travels in the clear beside what is sealed under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EphemeralEpoch {
+    pub pcs_key_hash: Digest<PcsKey>,
+    pub origin: Digest<CgkaOperation>,
+}
+
+/// The key ephemeral messages of `doc` are sealed under in the epoch whose group secret is
+/// `pcs_key`: derived under its own context from the secret and the document, so it is no
+/// content block's key and no other document's.
+fn ephemeral_key_from(pcs_key: &PcsKey, doc: DocumentId) -> SymmetricKey {
+    keyhive_crypto::context::Context::EPHEMERAL_MESSAGE_KEY
+        .hasher()
+        .update(pcs_key.0.as_slice())
+        .update(doc.as_slice())
+        .finalize_key()
+}
+
+/// Why an ephemeral key could not be asked for. "No key" is not an error: it is `Ok(None)`.
+#[derive(Debug, thiserror::Error)]
+pub enum EphemeralKeyError {
+    /// The document is not loaded in this instance.
+    #[error(transparent)]
+    NotFound(#[from] crate::error::not_found::NotFound),
+
+    /// Keyline could not answer a membership question the CGKA's replay needs.
+    #[error("Keyline storage: {0}")]
+    KeylineStorage(String),
+}
+
 /// Why a document's current PCS key could not be derived.
 #[derive(Debug, thiserror::Error)]
 pub enum PcsKeyError {
@@ -119,6 +151,38 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
         }
         let pcs_key = self.0.decrypt_current_group_secret()?;
         Ok(pcs_key.digest())
+    }
+
+    /// The current epoch of this group and its ephemeral key, if this member can derive the
+    /// epoch's secret. See [`Keyhive::ephemeral_key`].
+    pub fn current_ephemeral_key(
+        &mut self,
+        doc: DocumentId,
+    ) -> Result<Option<(EphemeralEpoch, SymmetricKey)>, CgkaError> {
+        Ok(self
+            .0
+            .current_root_secret()?
+            .map(|(origin, pcs_key)| {
+                let epoch = EphemeralEpoch {
+                    pcs_key_hash: pcs_key.digest(),
+                    origin,
+                };
+                (epoch, ephemeral_key_from(&pcs_key, doc))
+            }))
+    }
+
+    /// The ephemeral key of `epoch`, if this member can derive that epoch's secret: the
+    /// secret is found or derived from the hashes as a decryption does, so an epoch this
+    /// member is no longer in the current one of still opens, and one it never held does not.
+    pub fn ephemeral_key_for(
+        &mut self,
+        doc: DocumentId,
+        epoch: &EphemeralEpoch,
+    ) -> Result<SymmetricKey, CgkaError> {
+        let pcs_key = self
+            .0
+            .group_secret_from_hashes(&epoch.pcs_key_hash, &epoch.origin)?;
+        Ok(ephemeral_key_from(&pcs_key, doc))
     }
 
     /// The members who issued the concurrent updates that conflict at the tree

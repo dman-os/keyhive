@@ -1367,6 +1367,22 @@ impl<M: ImplicitRemovesProtocol> Cgka<M> {
             .then_some((op_hash, pcs_key))
     }
 
+    /// The root secret of the current epoch and the update that produced it, if this member
+    /// can derive it: the tree has a single head, and the owner's keys decrypt its root.
+    /// `None` is "no secret to use yet" (the first write after a membership change, or a
+    /// root conflicted by concurrent updates), which a write answers by rotating.
+    ///
+    /// Mutates only derived state (a pending replay, the recorded root secret), never the
+    /// graph or the tree, so reading a key for something that is not a write (a message
+    /// sealed to the group) rotates nothing.
+    #[instrument(skip_all)]
+    pub fn current_root_secret(
+        &mut self,
+    ) -> Result<Option<(Digest<CgkaOperation>, PcsKey)>, CgkaError> {
+        self.replay_if_pending()?;
+        Ok(self.record_tree_root_secret())
+    }
+
     /// Remove from the unchained updates each update in `entries` whose secret
     /// is verified.
     ///

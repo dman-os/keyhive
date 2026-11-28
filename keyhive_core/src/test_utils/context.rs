@@ -182,6 +182,7 @@ other_from!(
     keyhive_crypto::identifier::InvalidIdentifier,
     ReceiveCertificateError<Infallible>,
     ReceivePrekeyOpError,
+    crate::cgka::EphemeralKeyError,
     SigningError,
     keyhive_crypto::verified::SignError,
 );

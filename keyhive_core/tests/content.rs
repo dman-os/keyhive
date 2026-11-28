@@ -313,3 +313,101 @@ async fn writing_again_does_not_rotate_the_key_each_time() -> Result<()> {
     );
     Ok(())
 }
+
+/// The epoch an ephemeral message is sealed in names a key every member derives the same, and
+/// that no content block was written under.
+#[tokio::test]
+async fn members_derive_one_ephemeral_key_per_epoch() -> Result<()> {
+    let mut ctx = TestContext::new().await;
+    let alice = ctx.individual("alice").await?;
+    let bob = ctx.individual("bob").await?;
+    let design_doc = ctx.doc(&alice, "design_doc").await?;
+
+    alice.add_member(bob.id(), design_doc, Read).await?;
+    let (ct, content_key) = ctx.encrypt_keyed(&alice, design_doc, b"hello").await?;
+    ctx.sync_all_unsent().await?;
+
+    let (epoch, key) = alice
+        .ephemeral_key(design_doc)
+        .await?
+        .expect("alice wrote in this epoch, so she holds its secret");
+    assert_eq!(
+        epoch.pcs_key_hash,
+        ct.group_secret_hash.coerce(),
+        "the epoch is the one the content was written in"
+    );
+    assert_ne!(
+        key, content_key,
+        "an ephemeral key is no content block's key"
+    );
+    assert_eq!(
+        bob.ephemeral_key_for(design_doc, &epoch).await?,
+        Some(key),
+        "bob derives the key of an epoch named by its hashes"
+    );
+    Ok(())
+}
+
+/// A membership change leaves no current secret until someone writes, and an epoch that was
+/// current stays derivable for who held it.
+#[tokio::test]
+async fn a_membership_change_leaves_no_ephemeral_key_until_a_write() -> Result<()> {
+    let mut ctx = TestContext::new().await;
+    let alice = ctx.individual("alice").await?;
+    let bob = ctx.individual("bob").await?;
+    let carol = ctx.individual("carol").await?;
+    let design_doc = ctx.doc(&alice, "design_doc").await?;
+
+    alice.add_member(bob.id(), design_doc, Read).await?;
+    ctx.encrypt(&alice, design_doc, b"one").await?;
+    ctx.sync_all_unsent().await?;
+    let (first, first_key) = alice.ephemeral_key(design_doc).await?.expect("a write ran");
+
+    alice.add_member(carol.id(), design_doc, Read).await?;
+    assert_eq!(
+        alice.ephemeral_key(design_doc).await?,
+        None,
+        "the add blanked the root, and reading a key rotates nothing"
+    );
+    assert_eq!(
+        alice.ephemeral_key_for(design_doc, &first).await?,
+        Some(first_key.clone()),
+        "the epoch before the add is still derivable"
+    );
+
+    ctx.encrypt(&alice, design_doc, b"two").await?;
+    ctx.sync_all_unsent().await?;
+    let (second, second_key) = alice.ephemeral_key(design_doc).await?.expect("a write ran");
+    assert_ne!(first, second);
+    assert_eq!(
+        carol.ephemeral_key_for(design_doc, &second).await?,
+        Some(second_key)
+    );
+    assert_eq!(
+        carol.ephemeral_key_for(design_doc, &first).await?,
+        Some(first_key),
+        "a member added since is handed the earlier epochs' secrets, as it is for content"
+    );
+    Ok(())
+}
+
+/// A removed member does not derive the epoch the removal made.
+#[tokio::test]
+async fn a_removed_member_derives_no_later_ephemeral_key() -> Result<()> {
+    let mut ctx = TestContext::new().await;
+    let alice = ctx.individual("alice").await?;
+    let bob = ctx.individual("bob").await?;
+    let design_doc = ctx.doc(&alice, "design_doc").await?;
+
+    alice.add_member(bob.id(), design_doc, Read).await?;
+    ctx.encrypt(&alice, design_doc, b"one").await?;
+    ctx.sync_all_unsent().await?;
+
+    alice.revoke_member(bob.id(), true, design_doc).await?;
+    ctx.encrypt(&alice, design_doc, b"two").await?;
+    ctx.sync_all_unsent().await?;
+    let (after, _) = alice.ephemeral_key(design_doc).await?.expect("a write ran");
+
+    assert_eq!(bob.ephemeral_key_for(design_doc, &after).await?, None);
+    Ok(())
+}

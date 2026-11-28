@@ -7,7 +7,7 @@ use crate::{
     cgka::{
         certificate_sets::{CertificateSets, CitationSet},
         citations::{citation_of, KeylineImplicitRemovesProtocol, Members, SharedCitations},
-        AllCgkaOps, Cgka, PcsKeyError,
+        AllCgkaOps, Cgka, EphemeralEpoch, EphemeralKeyError, PcsKeyError,
     },
     contact_card::ContactCard,
     content::heads::ContentHeads,
@@ -2316,6 +2316,60 @@ where
             .ok_or(PcsKeyError::Unjoined)?;
         let hash = handle.lock().await.cgka_mut().try_pcs_key_hash();
         hash
+    }
+
+    /// The key `doc`'s members seal ephemeral messages under in its current epoch, with the
+    /// epoch it belongs to, or `None` while this replica holds no usable secret for the
+    /// document yet: it has not joined, or its CGKA has no current secret it can derive (the
+    /// first write after a membership change is what makes one, by rotating).
+    ///
+    /// This is a read: it rotates nothing and writes nothing, so a message is no CGKA
+    /// operation. It changes only what the CGKA derives and remembers (a pending replay, the
+    /// recorded root secret), and takes the document's lock for that.
+    ///
+    /// Errors with [`NotFound`] if the document is not loaded ([`Keyhive::hydrate`]).
+    #[instrument(skip_all)]
+    pub async fn ephemeral_key(
+        &self,
+        doc: DocumentId,
+    ) -> Result<Option<(EphemeralEpoch, SymmetricKey)>, EphemeralKeyError> {
+        let Some(state) = self.member_document(doc).await? else {
+            return Ok(None);
+        };
+        let mut locked = state.lock().await;
+        let keyed = self
+            .require_keyline_answers(doc.into(), locked.cgka_mut(), |cgka| {
+                cgka.current_ephemeral_key(doc)
+            })
+            .await
+            .map_err(|e| EphemeralKeyError::KeylineStorage(e.to_string()))?;
+        // Any other failure is a secret this replica cannot derive, which is "no key yet".
+        Ok(keyed.unwrap_or(None))
+    }
+
+    /// The key of `epoch` for `doc`'s ephemeral messages, or `None` if this replica cannot
+    /// derive that epoch's secret: it never held it (a message sealed before it joined, or
+    /// after it was removed), or the update that produced it has not arrived. An epoch that
+    /// is no longer the current one still opens, as the content written in it does.
+    ///
+    /// Errors with [`NotFound`] if the document is not loaded ([`Keyhive::hydrate`]).
+    #[instrument(skip_all)]
+    pub async fn ephemeral_key_for(
+        &self,
+        doc: DocumentId,
+        epoch: &EphemeralEpoch,
+    ) -> Result<Option<SymmetricKey>, EphemeralKeyError> {
+        let Some(state) = self.member_document(doc).await? else {
+            return Ok(None);
+        };
+        let mut locked = state.lock().await;
+        let keyed = self
+            .require_keyline_answers(doc.into(), locked.cgka_mut(), |cgka| {
+                cgka.ephemeral_key_for(doc, epoch)
+            })
+            .await
+            .map_err(|e| EphemeralKeyError::KeylineStorage(e.to_string()))?;
+        Ok(keyed.ok())
     }
 
     /// Try causal decrypt from more than one entrypoint at once.
